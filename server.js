@@ -14,6 +14,7 @@ const PORT = process.env.PORT || 3001;
 const N8N_BASE_URL = process.env.N8N_BASE_URL || "http://localhost:5678";
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
 const USER_EMAIL = process.env.USER_EMAIL || "your-email@example.com";
+const SMTP_CREDENTIAL_ID = process.env.SMTP_CREDENTIAL_ID || "";
 const n8nClient = axios.create({
   baseURL: N8N_BASE_URL,
   headers: {
@@ -47,6 +48,41 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["workflow_id"],
         },
       },
+      {
+        name: "create_workflow",
+        description: "Create a new workflow with optional initial nodes",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Workflow name" },
+            description: { type: "string", description: "Workflow description (optional)" },
+          },
+          required: ["name"],
+        },
+      },
+      {
+        name: "delete_workflow",
+        description: "Permanently delete a workflow by ID",
+        inputSchema: {
+          type: "object",
+          properties: {
+            workflow_id: { type: "string", description: "The workflow ID to delete" },
+          },
+          required: ["workflow_id"],
+        },
+      },
+      {
+        name: "activate_workflow",
+        description: "Activate or deactivate a workflow",
+        inputSchema: {
+          type: "object",
+          properties: {
+            workflow_id: { type: "string" },
+            active: { type: "boolean" },
+          },
+          required: ["workflow_id", "active"],
+        },
+      },
       // Node Management
       {
         name: "add_node_to_workflow",
@@ -66,6 +102,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "object",
               description: "Node configuration parameters"
             },
+            credentials: {
+              type: "object",
+              description: "Credentials to attach (e.g., { smtpAuth: { id: 'abc', name: 'SMTP account' } })"
+            },
           },
           required: ["workflow_id", "node_name", "node_type", "position"],
         },
@@ -84,15 +124,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "update_node",
-        description: "Update a node's configuration in a workflow",
+        description: "Update a node's configuration and/or credentials in a workflow",
         inputSchema: {
           type: "object",
           properties: {
             workflow_id: { type: "string" },
             node_name: { type: "string" },
-            config: { type: "object", description: "Updated configuration" },
+            config: { type: "object", description: "Updated parameters configuration" },
+            credentials: {
+              type: "object",
+              description: "Credentials to set (e.g., { smtpAuth: { id: 'abc', name: 'SMTP account' } })"
+            },
           },
-          required: ["workflow_id", "node_name", "config"],
+          required: ["workflow_id", "node_name"],
         },
       },
       {
@@ -112,13 +156,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       // Workflow Execution
       {
         name: "execute_workflow",
-        description: "Execute/run a workflow immediately",
+        description: "Execute/run a workflow immediately and return the execution ID. Works with any trigger type including Manual Trigger.",
         inputSchema: {
           type: "object",
           properties: {
             workflow_id: { type: "string", description: "The workflow ID to execute" },
           },
           required: ["workflow_id"],
+        },
+      },
+      {
+        name: "get_execution_result",
+        description: "Get the detailed result/output data of a specific execution",
+        inputSchema: {
+          type: "object",
+          properties: {
+            execution_id: { type: "string", description: "The execution ID to retrieve" },
+          },
+          required: ["execution_id"],
         },
       },
       {
@@ -237,7 +292,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "set_schedule",
-        description: "Set a cron schedule for a workflow",
+        description: "Set a cron schedule for a workflow. Adds or updates a Schedule Trigger node with the given cron expression.",
         inputSchema: {
           type: "object",
           properties: {
@@ -247,34 +302,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["workflow_id", "cron"],
         },
       },
-      // Workflow Creation & Building
-      {
-        name: "create_workflow",
-        description: "Create a new workflow with optional initial nodes",
-        inputSchema: {
-          type: "object",
-          properties: {
-            name: { type: "string", description: "Workflow name" },
-          },
-          required: ["name"],
-        },
-      },
-      {
-        name: "activate_workflow",
-        description: "Activate or deactivate a workflow",
-        inputSchema: {
-          type: "object",
-          properties: {
-            workflow_id: { type: "string" },
-            active: { type: "boolean" },
-          },
-          required: ["workflow_id", "active"],
-        },
-      },
       // Email Notification
       {
         name: "send_result_email",
-        description: "Send workflow results via email",
+        description: "Send workflow results via email using SMTP",
         inputSchema: {
           type: "object",
           properties: {
@@ -332,6 +363,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   name: n.name,
                   type: n.type,
                   position: n.position,
+                  credentials: n.credentials || undefined,
                 })),
                 connections: workflow.connections,
               },
@@ -354,7 +386,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "add_node_to_workflow") {
-      const { workflow_id, node_name, node_type, position, config = {} } = args;
+      const { workflow_id, node_name, node_type, position, config = {}, credentials } = args;
       const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
       const newNode = {
         id: crypto.randomUUID(),
@@ -364,13 +396,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         parameters: config,
         typeVersion: 1,
       };
+      // Attach credentials if provided
+      if (credentials) {
+        newNode.credentials = credentials;
+      }
       workflow.nodes.push(newNode);
       await saveWorkflow(workflow_id, workflow);
       return {
         content: [
           {
             type: "text",
-            text: `Added node "${node_name}" (${node_type}) to workflow`,
+            text: `Added node "${node_name}" (${node_type}) to workflow${credentials ? " with credentials" : ""}`,
           },
         ],
       };
@@ -394,14 +430,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
     if (name === "update_node") {
-      const { workflow_id, node_name, config } = args;
+      const { workflow_id, node_name, config, credentials } = args;
       const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
       const node = workflow.nodes.find((n) => n.name === node_name);
       if (!node) throw new Error(`Node "${node_name}" not found`);
-      node.parameters = { ...node.parameters, ...config };
+      // Update parameters if config provided
+      if (config) {
+        node.parameters = { ...node.parameters, ...config };
+      }
+      // Update credentials if provided
+      if (credentials) {
+        node.credentials = { ...node.credentials, ...credentials };
+      }
       await saveWorkflow(workflow_id, workflow);
+      const updates = [];
+      if (config) updates.push("parameters");
+      if (credentials) updates.push("credentials");
       return {
-        content: [{ type: "text", text: `Updated node "${node_name}" configuration` }],
+        content: [{ type: "text", text: `Updated node "${node_name}" ${updates.join(" and ")}` }],
       };
     }
     if (name === "connect_nodes") {
@@ -420,50 +466,93 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       await saveWorkflow(workflow_id, workflow);
       return {
-        content: [{ type: "text", text: `Connected "${from_node}" → "${to_node}"` }],
+        content: [{ type: "text", text: `Connected "${from_node}" \u2192 "${to_node}"` }],
       };
     }
     // ============ WORKFLOW EXECUTION ============
     if (name === "execute_workflow") {
       const { workflow_id } = args;
-      // n8n public API doesn't support direct execution
-      // Use webhook-based execution: find or create a webhook trigger
-      const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
-      const webhookNode = workflow.nodes.find((n) => n.type.includes("webhook"));
-      if (webhookNode) {
-        const path = webhookNode.parameters?.path || workflow_id;
-        const webhookUrl = `${N8N_BASE_URL}/webhook/${path}`;
-        try {
-          const response = await axios.post(webhookUrl, { trigger: "mcp" });
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Workflow executed via webhook!\n\nWebhook URL: ${webhookUrl}\nResponse: ${JSON.stringify(response.data, null, 2)}`,
-              },
-            ],
-          };
-        } catch (e) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Webhook call failed (is the workflow active?): ${e.message}\n\nWebhook URL: ${webhookUrl}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      } else {
+      // Use the n8n internal API to run workflow directly
+      // This works with any trigger type including Manual Trigger
+      try {
+        const response = await n8nClient.post("/api/v1/executions", {
+          workflowId: workflow_id,
+        });
+        const execution = response.data;
         return {
           content: [
             {
               type: "text",
-              text: `Workflow has no Webhook trigger node. To execute via API:\n1. Add a Webhook node to the workflow\n2. Activate the workflow\n3. Then call execute_workflow again\n\nAlternatively, use the n8n UI to run workflows with Manual Trigger nodes.`,
+              text: `Workflow executed!\n\nExecution ID: ${execution.data?.id || execution.id}\nStatus: ${execution.data?.status || execution.status || "running"}\n\nUse get_execution_result with the execution ID to see the output.`,
             },
           ],
         };
+      } catch (execError) {
+        // Fallback: try the evaluate endpoint used by n8n internally
+        try {
+          const response = await n8nClient.post(`/api/v1/workflows/${workflow_id}/run`, {
+            runData: {},
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Workflow executed!\n\nResult: ${JSON.stringify(response.data, null, 2)}`,
+              },
+            ],
+          };
+        } catch (runError) {
+          // Final fallback: try webhook-based execution
+          const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
+          const webhookNode = workflow.nodes.find((n) => n.type.includes("webhook"));
+          if (webhookNode) {
+            const path = webhookNode.parameters?.path || workflow_id;
+            const webhookUrl = `${N8N_BASE_URL}/webhook/${path}`;
+            const response = await axios.post(webhookUrl, { trigger: "mcp" });
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Workflow executed via webhook!\n\nWebhook URL: ${webhookUrl}\nResponse: ${JSON.stringify(response.data, null, 2)}`,
+                },
+              ],
+            };
+          }
+          throw new Error(
+            `Could not execute workflow. API error: ${execError.response?.data?.message || execError.message}. ` +
+            `Run error: ${runError.response?.data?.message || runError.message}`
+          );
+        }
       }
+    }
+    if (name === "get_execution_result") {
+      const { execution_id } = args;
+      const response = await n8nClient.get(`/api/v1/executions/${execution_id}`);
+      const execution = response.data;
+      // Extract output data from the last node that ran
+      const resultData = execution.data?.resultData;
+      let output = null;
+      if (resultData?.runData) {
+        const nodeNames = Object.keys(resultData.runData);
+        const lastNode = nodeNames[nodeNames.length - 1];
+        if (lastNode && resultData.runData[lastNode]) {
+          const runs = resultData.runData[lastNode];
+          const lastRun = runs[runs.length - 1];
+          output = lastRun?.data?.main?.[0] || lastRun;
+        }
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Execution ${execution_id}:\n\nStatus: ${execution.status || execution.data?.status}\nStarted: ${execution.startedAt}\nFinished: ${execution.stoppedAt}\nWorkflow: ${execution.workflowId}\n\n${
+              output
+                ? `Output (last node):\n${JSON.stringify(output, null, 2)}`
+                : `Full result data:\n${JSON.stringify(resultData, null, 2)}`
+            }`,
+          },
+        ],
+      };
     }
     if (name === "get_workflow_executions") {
       const { workflow_id, limit = 10 } = args;
@@ -515,40 +604,70 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "get_webhook_logs") {
       const { workflow_id, limit = 20 } = args;
+      // Fetch recent executions for this workflow as webhook logs
+      const response = await n8nClient.get(`/api/v1/executions?workflowId=${workflow_id}`);
+      const executions = (response.data.data || []).slice(0, limit);
       return {
         content: [
           {
             type: "text",
-            text: `Webhook logs endpoint: ${N8N_BASE_URL}/api/v1/workflows/${workflow_id}/webhooks/logs?limit=${limit}`,
+            text: `Recent executions for workflow ${workflow_id}:\n\n${JSON.stringify(
+              executions.map((e) => ({
+                id: e.id,
+                status: e.status,
+                startedAt: e.startedAt,
+                stoppedAt: e.stoppedAt,
+                mode: e.mode,
+              })),
+              null,
+              2
+            )}`,
           },
         ],
       };
     }
     // ============ CREDENTIALS ============
     if (name === "list_credentials") {
-      // n8n community edition doesn't support GET /credentials in the public API
-      // Instead, scan workflows for credential references
-      const wfResponse = await n8nClient.get("/api/v1/workflows");
-      const workflows = wfResponse.data.data || [];
-      const credentialSet = new Map();
-      for (const wf of workflows) {
-        for (const node of (wf.nodes || [])) {
-          if (node.credentials) {
-            for (const [type, cred] of Object.entries(node.credentials)) {
-              credentialSet.set(cred.id, { id: cred.id, name: cred.name, type });
+      // Try the credentials API first (works on newer n8n versions)
+      try {
+        const response = await n8nClient.get("/api/v1/credentials");
+        const credentials = response.data.data || [];
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Found ${credentials.length} credentials:\n\n${JSON.stringify(
+                credentials.map((c) => ({ id: c.id, name: c.name, type: c.type })),
+                null,
+                2
+              )}`,
+            },
+          ],
+        };
+      } catch {
+        // Fallback: scan workflows for credential references
+        const wfResponse = await n8nClient.get("/api/v1/workflows");
+        const workflows = wfResponse.data.data || [];
+        const credentialSet = new Map();
+        for (const wf of workflows) {
+          for (const node of (wf.nodes || [])) {
+            if (node.credentials) {
+              for (const [type, cred] of Object.entries(node.credentials)) {
+                credentialSet.set(cred.id, { id: cred.id, name: cred.name, type });
+              }
             }
           }
         }
+        const credentials = Array.from(credentialSet.values());
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Found ${credentials.length} credentials referenced in workflows:\n\n${JSON.stringify(credentials, null, 2)}`,
+            },
+          ],
+        };
       }
-      const credentials = Array.from(credentialSet.values());
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Found ${credentials.length} credentials referenced in workflows:\n\n${JSON.stringify(credentials, null, 2)}`,
-          },
-        ],
-      };
     }
     if (name === "create_credential") {
       const { name: cred_name, type, data } = args;
@@ -606,8 +725,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const response = await n8nClient.get("/api/v1/workflows");
       const workflows = response.data.data || [];
       const scheduled = workflows
-        .filter((w) => w.nodes.some((n) => n.type.includes("schedule")))
-        .map((w) => ({ id: w.id, name: w.name }));
+        .filter((w) => w.nodes.some((n) => n.type.includes("schedule") || n.type.includes("cron")))
+        .map((w) => {
+          const schedNode = w.nodes.find((n) => n.type.includes("schedule") || n.type.includes("cron"));
+          return {
+            id: w.id,
+            name: w.name,
+            active: w.active,
+            scheduleConfig: schedNode?.parameters || {},
+          };
+        });
       return {
         content: [
           {
@@ -619,29 +746,77 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "set_schedule") {
       const { workflow_id, cron } = args;
+      const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
+      // Find existing schedule trigger node
+      const scheduleIdx = workflow.nodes.findIndex(
+        (n) => n.type.includes("scheduleTrigger") || n.type.includes("cron")
+      );
+      const scheduleNode = {
+        id: scheduleIdx >= 0 ? workflow.nodes[scheduleIdx].id : crypto.randomUUID(),
+        name: "Schedule Trigger",
+        type: "n8n-nodes-base.scheduleTrigger",
+        position: scheduleIdx >= 0 ? workflow.nodes[scheduleIdx].position : [-200, 0],
+        parameters: {
+          rule: {
+            interval: [
+              {
+                field: "cronExpression",
+                expression: cron,
+              },
+            ],
+          },
+        },
+        typeVersion: 1.2,
+      };
+      if (scheduleIdx >= 0) {
+        workflow.nodes[scheduleIdx] = scheduleNode;
+      } else {
+        workflow.nodes.push(scheduleNode);
+      }
+      await saveWorkflow(workflow_id, workflow);
       return {
         content: [
           {
             type: "text",
-            text: `To set schedule for workflow:\n1. Add a "Schedule Trigger" node\n2. Set cron expression to: ${cron}\n3. Save workflow`,
+            text: `Schedule set for workflow!\n\nCron: ${cron}\nNode: Schedule Trigger${
+              scheduleIdx < 0
+                ? "\n\nNote: New Schedule Trigger node added. You may want to connect it to your first processing node."
+                : "\n\nExisting Schedule Trigger updated."
+            }`,
           },
         ],
       };
     }
     // ============ WORKFLOW MANAGEMENT ============
     if (name === "create_workflow") {
-      const { name: wf_name } = args;
-      const response = await n8nClient.post("/api/v1/workflows", {
+      const { name: wf_name, description } = args;
+      const payload = {
         name: wf_name,
         nodes: [],
         connections: {},
         settings: {},
-      });
+      };
+      const response = await n8nClient.post("/api/v1/workflows", payload);
       return {
         content: [
           {
             type: "text",
             text: `Created workflow:\n\nID: ${response.data.id}\nName: ${response.data.name}\n\nYou can now add nodes to it!`,
+          },
+        ],
+      };
+    }
+    if (name === "delete_workflow") {
+      const { workflow_id } = args;
+      // First get the name for confirmation
+      const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
+      const wfName = workflow.name;
+      await n8nClient.delete(`/api/v1/workflows/${workflow_id}`);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Deleted workflow "${wfName}" (ID: ${workflow_id})`,
           },
         ],
       };
@@ -664,42 +839,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // ============ EMAIL NOTIFICATIONS ============
     if (name === "send_result_email") {
       const { subject, body, to_email = USER_EMAIL } = args;
+      // Create a temporary email workflow using SMTP (not SendGrid)
+      const emailNodes = [
+        {
+          id: crypto.randomUUID(),
+          name: "Start",
+          type: "n8n-nodes-base.manualTrigger",
+          position: [0, 0],
+          parameters: {},
+          typeVersion: 1,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Send Email",
+          type: "n8n-nodes-base.emailSend",
+          position: [200, 0],
+          parameters: {
+            fromEmail: USER_EMAIL,
+            toEmail: to_email,
+            subject: subject,
+            html: body,
+          },
+          typeVersion: 1,
+        },
+      ];
+      // Attach SMTP credentials if configured
+      if (SMTP_CREDENTIAL_ID) {
+        emailNodes[1].credentials = {
+          smtp: { id: SMTP_CREDENTIAL_ID, name: "SMTP account" },
+        };
+      }
       const emailWorkflow = await n8nClient.post("/api/v1/workflows", {
-        name: `Auto-Email: ${subject}`,
-        nodes: [
-          {
-            name: "Webhook",
-            type: "@n8n/n8n-nodes-base.webhook",
-            position: [100, 100],
-            parameters: {},
-          },
-          {
-            name: "SendGrid",
-            type: "@n8n/n8n-nodes-base.sendGrid",
-            position: [300, 100],
-            parameters: {
-              fromEmail: "noreply@n8n.io",
-              toEmail: to_email,
-              subject: subject,
-              textContent: body,
-            },
-          },
-        ],
+        name: `_auto_email_${Date.now()}`,
+        nodes: emailNodes,
         connections: {
-          Webhook: {
-            main: [[{ node: "SendGrid", type: "main", index: 0 }]],
+          Start: {
+            main: [[{ node: "Send Email", type: "main", index: 0 }]],
           },
         },
+        settings: {},
       });
-      await n8nClient.put(`/api/v1/workflows/${emailWorkflow.data.id}`, {
-        active: true,
-      });
-      await n8nClient.post(`/api/v1/workflows/${emailWorkflow.data.id}/execute`, {});
+      const wfId = emailWorkflow.data.id;
+      // Try to execute the email workflow
+      let executionResult = "created but could not auto-execute";
+      try {
+        const execResponse = await n8nClient.post("/api/v1/executions", {
+          workflowId: wfId,
+        });
+        executionResult = `executed (ID: ${execResponse.data?.data?.id || execResponse.data?.id || "unknown"})`;
+      } catch (execErr) {
+        executionResult = `created but execution failed: ${execErr.response?.data?.message || execErr.message}. Open the workflow in n8n UI and run manually.`;
+      }
+      // Clean up: delete the temporary workflow
+      try {
+        await n8nClient.delete(`/api/v1/workflows/${wfId}`);
+        executionResult += " (temp workflow cleaned up)";
+      } catch {
+        executionResult += ` (temp workflow ${wfId} remains - delete manually)`;
+      }
       return {
         content: [
           {
             type: "text",
-            text: `Email sent to ${to_email}!\n\nSubject: ${subject}\n\nA workflow was created and executed to send this email.`,
+            text: `Email to ${to_email}:\n\nSubject: ${subject}\nStatus: ${executionResult}`,
           },
         ],
       };
@@ -747,7 +949,7 @@ const httpServer = createServer(async (req, res) => {
   // Health check
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", server: "n8n-mcp-server", version: "2.0.0" }));
+    res.end(JSON.stringify({ status: "ok", server: "n8n-mcp-server", version: "2.1.0" }));
     return;
   }
 
@@ -765,7 +967,7 @@ const httpServer = createServer(async (req, res) => {
         });
 
         const serverInstance = new Server(
-          { name: "n8n-mcp-server", version: "2.0.0" },
+          { name: "n8n-mcp-server", version: "2.1.0" },
           { capabilities: { tools: {} } }
         );
         registerHandlers(serverInstance);
@@ -834,7 +1036,7 @@ const httpServer = createServer(async (req, res) => {
     };
 
     const serverInstance = new Server(
-      { name: "n8n-mcp-server", version: "2.0.0" },
+      { name: "n8n-mcp-server", version: "2.1.0" },
       { capabilities: { tools: {} } }
     );
 
@@ -865,7 +1067,7 @@ const httpServer = createServer(async (req, res) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.error(`n8n MCP Server v2.0 running on port ${PORT}`);
+  console.error(`n8n MCP Server v2.1.0 running on port ${PORT}`);
   console.error(`Streamable HTTP: http://localhost:${PORT}/mcp`);
   console.error(`Legacy SSE:     http://localhost:${PORT}/sse`);
   console.error(`Health check:   http://localhost:${PORT}/health`);
