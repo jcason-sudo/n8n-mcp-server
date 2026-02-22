@@ -1155,6 +1155,7 @@ const httpServer = createServer(async (req, res) => {
         // New session - create transport and server
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => crypto.randomUUID(),
+          enableJsonResponse: true,
         });
 
         const serverInstance = new Server(
