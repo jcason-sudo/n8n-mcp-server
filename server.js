@@ -316,6 +316,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["subject", "body"],
         },
       },
+      // Full Workflow Update
+      {
+        name: "update_workflow",
+        description: "Update a workflow by replacing its entire definition via PUT. Pass the complete workflow JSON (nodes, connections, name, settings). Use get_workflow_details first to get the current state, modify it, then pass it here.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            workflow_id: { type: "string", description: "The workflow ID to update" },
+            workflow_json: { type: "string", description: "Complete workflow JSON string with nodes, connections, name, settings" },
+          },
+          required: ["workflow_id", "workflow_json"],
+        },
+      },
+      // Disconnect Nodes
+      {
+        name: "disconnect_nodes",
+        description: "Remove a connection between two nodes in a workflow",
+        inputSchema: {
+          type: "object",
+          properties: {
+            workflow_id: { type: "string", description: "The workflow ID" },
+            from_node: { type: "string", description: "Source node name" },
+            to_node: { type: "string", description: "Target node name" },
+          },
+          required: ["workflow_id", "from_node", "to_node"],
+        },
+      },
     ],
   };
 });
@@ -472,8 +499,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // ============ WORKFLOW EXECUTION ============
     if (name === "execute_workflow") {
       const { workflow_id } = args;
-      // Use the n8n internal API to run workflow directly
-      // This works with any trigger type including Manual Trigger
+      // Strategy: try multiple n8n API endpoints for execution
+      // n8n CE has different endpoints across versions
+      const errors = [];
+
+      // Attempt 1: POST /api/v1/executions (n8n >= 1.x with execution API)
       try {
         const response = await n8nClient.post("/api/v1/executions", {
           workflowId: workflow_id,
@@ -487,43 +517,56 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
-      } catch (execError) {
-        // Fallback: try the evaluate endpoint used by n8n internally
-        try {
-          const response = await n8nClient.post(`/api/v1/workflows/${workflow_id}/run`, {
-            runData: {},
-          });
+      } catch (e1) {
+        errors.push(`POST /executions: ${e1.response?.status} ${e1.response?.data?.message || e1.message}`);
+      }
+
+      // Attempt 2: POST /rest/workflows/{id}/run (n8n internal/editor API - most reliable)
+      try {
+        const response = await n8nClient.post(`/rest/workflows/${workflow_id}/run`, {
+          runData: {},
+          startNodes: [],
+        });
+        const execution = response.data;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workflow executed!\n\nExecution ID: ${execution.data?.executionId || execution.executionId || "unknown"}\nStatus: running\n\nUse get_execution_result with the execution ID to see the output.`,
+            },
+          ],
+        };
+      } catch (e2) {
+        errors.push(`POST /rest/workflows/run: ${e2.response?.status} ${e2.response?.data?.message || e2.message}`);
+      }
+
+      // Attempt 3: Webhook-based execution (if workflow has a webhook node)
+      try {
+        const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
+        const webhookNode = workflow.nodes.find((n) => n.type.includes("webhook"));
+        if (webhookNode) {
+          const path = webhookNode.parameters?.path || workflow_id;
+          const httpMethod = (webhookNode.parameters?.httpMethod || "POST").toUpperCase();
+          const webhookUrl = `${N8N_BASE_URL}/webhook/${path}`;
+          const response = httpMethod === "GET"
+            ? await axios.get(webhookUrl)
+            : await axios.post(webhookUrl, { trigger: "mcp" });
           return {
             content: [
               {
                 type: "text",
-                text: `Workflow executed!\n\nResult: ${JSON.stringify(response.data, null, 2)}`,
+                text: `Workflow executed via webhook!\n\nWebhook URL: ${webhookUrl}\nMethod: ${httpMethod}\nResponse: ${JSON.stringify(response.data, null, 2)}`,
               },
             ],
           };
-        } catch (runError) {
-          // Final fallback: try webhook-based execution
-          const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
-          const webhookNode = workflow.nodes.find((n) => n.type.includes("webhook"));
-          if (webhookNode) {
-            const path = webhookNode.parameters?.path || workflow_id;
-            const webhookUrl = `${N8N_BASE_URL}/webhook/${path}`;
-            const response = await axios.post(webhookUrl, { trigger: "mcp" });
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Workflow executed via webhook!\n\nWebhook URL: ${webhookUrl}\nResponse: ${JSON.stringify(response.data, null, 2)}`,
-                },
-              ],
-            };
-          }
-          throw new Error(
-            `Could not execute workflow. API error: ${execError.response?.data?.message || execError.message}. ` +
-            `Run error: ${runError.response?.data?.message || runError.message}`
-          );
         }
+      } catch (e3) {
+        errors.push(`Webhook fallback: ${e3.response?.status || ""} ${e3.response?.data?.message || e3.message}`);
       }
+
+      throw new Error(
+        `Could not execute workflow ${workflow_id}. All methods failed:\n${errors.join("\n")}\n\nTip: Ensure the workflow is saved and has a Manual Trigger or Webhook node.`
+      );
     }
     if (name === "get_execution_result") {
       const { execution_id } = args;
@@ -823,17 +866,76 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "activate_workflow") {
       const { workflow_id, active } = args;
-      const endpoint = active ? "activate" : "deactivate";
-      const response = await n8nClient.post(`/api/v1/workflows/${workflow_id}/${endpoint}`);
+      // Use PUT to toggle active status (works on all n8n CE versions)
+      try {
+        const response = await n8nClient.post(`/api/v1/workflows/${workflow_id}/${active ? "activate" : "deactivate"}`);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workflow "${response.data.name}" is now ${active ? "ACTIVE" : "INACTIVE"}`,
+            },
+          ],
+        };
+      } catch (activateErr) {
+        // Fallback: use PUT to set active field directly
+        const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
+        workflow.active = active;
+        const updated = await saveWorkflow(workflow_id, workflow);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workflow "${updated.data.name || workflow.name}" is now ${active ? "ACTIVE" : "INACTIVE"} (via PUT)`,
+            },
+          ],
+        };
+      }
+    }
+    // ============ FULL WORKFLOW UPDATE ============
+    if (name === "update_workflow") {
+      const { workflow_id, workflow_json } = args;
+      const body = JSON.parse(workflow_json);
+      const response = await n8nClient.put(`/api/v1/workflows/${workflow_id}`, {
+        name: body.name,
+        nodes: body.nodes,
+        connections: body.connections,
+        settings: body.settings || {},
+      });
+      const wf = response.data;
       return {
         content: [
           {
             type: "text",
-            text: `Workflow "${response.data.name}" is now ${
-              active ? "ACTIVE" : "INACTIVE"
-            }`,
+            text: `Workflow updated via PUT!\n\nID: ${wf.id}\nName: ${wf.name}\nNodes: ${wf.nodes?.length || 0}\nActive: ${wf.active}`,
           },
         ],
+      };
+    }
+    // ============ DISCONNECT NODES ============
+    if (name === "disconnect_nodes") {
+      const { workflow_id, from_node, to_node } = args;
+      const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
+      let removed = false;
+      if (workflow.connections[from_node]) {
+        for (const outputType of Object.keys(workflow.connections[from_node])) {
+          workflow.connections[from_node][outputType] = workflow.connections[from_node][outputType].map(
+            (arr) => {
+              const filtered = arr.filter((c) => c.node !== to_node);
+              if (filtered.length < arr.length) removed = true;
+              return filtered;
+            }
+          );
+        }
+      }
+      if (!removed) {
+        return {
+          content: [{ type: "text", text: `No connection found from "${from_node}" to "${to_node}".` }],
+        };
+      }
+      await saveWorkflow(workflow_id, workflow);
+      return {
+        content: [{ type: "text", text: `Disconnected "${from_node}" ✕ "${to_node}"` }],
       };
     }
     // ============ EMAIL NOTIFICATIONS ============
