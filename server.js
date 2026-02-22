@@ -1199,17 +1199,14 @@ const httpServer = createServer(async (req, res) => {
       return;
     }
 
-    // DELETE /mcp - close session
+    // DELETE /mcp - close session (disabled: Claude tends to prematurely close sessions)
     if (req.method === "DELETE") {
+      // Acknowledge the DELETE but don't actually close the session
+      // This prevents Claude's MCP client from tearing down sessions too early
       const sessionId = req.headers["mcp-session-id"];
-      const transport = streamableTransports.get(sessionId);
-      if (transport) {
-        await transport.handleRequest(req, res);
-        streamableTransports.delete(sessionId);
-      } else {
-        res.writeHead(404);
-        res.end();
-      }
+      console.error(`DELETE requested for session ${sessionId} - keeping session alive`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
       return;
     }
   }
