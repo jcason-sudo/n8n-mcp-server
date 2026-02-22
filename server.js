@@ -521,23 +521,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         errors.push(`POST /executions: ${e1.response?.status} ${e1.response?.data?.message || e1.message}`);
       }
 
-      // Attempt 2: POST /rest/workflows/{id}/run (n8n internal/editor API - most reliable)
+      // Attempt 2: POST /api/v1/workflows/{id}/run (public API run endpoint, some versions)
       try {
-        const response = await n8nClient.post(`/rest/workflows/${workflow_id}/run`, {
-          runData: {},
-          startNodes: [],
-        });
+        const response = await n8nClient.post(`/api/v1/workflows/${workflow_id}/run`);
         const execution = response.data;
         return {
           content: [
             {
               type: "text",
-              text: `Workflow executed!\n\nExecution ID: ${execution.data?.executionId || execution.executionId || "unknown"}\nStatus: running\n\nUse get_execution_result with the execution ID to see the output.`,
+              text: `Workflow executed!\n\nExecution ID: ${execution.data?.executionId || execution.executionId || execution.data?.id || "unknown"}\nStatus: running\n\nUse get_execution_result with the execution ID to see the output.`,
             },
           ],
         };
       } catch (e2) {
-        errors.push(`POST /rest/workflows/run: ${e2.response?.status} ${e2.response?.data?.message || e2.message}`);
+        errors.push(`POST /api/v1/workflows/run: ${e2.response?.status} ${e2.response?.data?.message || e2.message}`);
       }
 
       // Attempt 3: Webhook-based execution (if workflow has a webhook node)
@@ -562,6 +559,77 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       } catch (e3) {
         errors.push(`Webhook fallback: ${e3.response?.status || ""} ${e3.response?.data?.message || e3.message}`);
+      }
+
+      // Attempt 4: Create a temporary webhook-triggered wrapper workflow that
+      // uses the Execute Workflow node to run the target workflow
+      try {
+        const wrapperPath = `_exec_${workflow_id}_${Date.now()}`;
+        const wrapperNodes = [
+          {
+            id: crypto.randomUUID(),
+            name: "Webhook",
+            type: "n8n-nodes-base.webhook",
+            position: [0, 0],
+            parameters: { path: wrapperPath, httpMethod: "GET", responseMode: "lastNode" },
+            typeVersion: 2,
+            webhookId: crypto.randomUUID(),
+          },
+          {
+            id: crypto.randomUUID(),
+            name: "Execute Target",
+            type: "n8n-nodes-base.executeWorkflow",
+            position: [300, 0],
+            parameters: { workflowId: { value: workflow_id }, mode: "once" },
+            typeVersion: 1,
+          },
+        ];
+        const wrapperWf = await n8nClient.post("/api/v1/workflows", {
+          name: `_auto_exec_${Date.now()}`,
+          nodes: wrapperNodes,
+          connections: {
+            Webhook: { main: [[{ node: "Execute Target", type: "main", index: 0 }]] },
+          },
+          settings: {},
+        });
+        const wrapperId = wrapperWf.data.id;
+
+        // Activate it so webhook registers
+        try {
+          await n8nClient.post(`/api/v1/workflows/${wrapperId}/activate`);
+        } catch {
+          // Try PUT fallback
+          const wf = (await n8nClient.get(`/api/v1/workflows/${wrapperId}`)).data;
+          wf.active = true;
+          await n8nClient.put(`/api/v1/workflows/${wrapperId}`, {
+            name: wf.name, nodes: wf.nodes, connections: wf.connections,
+            settings: wf.settings || {}, active: true,
+          });
+        }
+
+        // Small delay for webhook registration
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Trigger via webhook
+        const webhookUrl = `${N8N_BASE_URL}/webhook/${wrapperPath}`;
+        const execResponse = await axios.get(webhookUrl);
+
+        // Cleanup wrapper
+        try {
+          await n8nClient.post(`/api/v1/workflows/${wrapperId}/deactivate`).catch(() => {});
+          await n8nClient.delete(`/api/v1/workflows/${wrapperId}`);
+        } catch {}
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workflow executed via wrapper!\n\nTarget: ${workflow_id}\nResponse: ${JSON.stringify(execResponse.data, null, 2)}\n(wrapper workflow cleaned up)`,
+            },
+          ],
+        };
+      } catch (e4) {
+        errors.push(`Wrapper execution: ${e4.response?.status || ""} ${e4.response?.data?.message || e4.message}`);
       }
 
       throw new Error(
@@ -941,21 +1009,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // ============ EMAIL NOTIFICATIONS ============
     if (name === "send_result_email") {
       const { subject, body, to_email = USER_EMAIL } = args;
-      // Create a temporary email workflow using SMTP (not SendGrid)
+      // Create a temporary email workflow with webhook trigger for reliable execution
+      const webhookPath = `_email_${Date.now()}`;
       const emailNodes = [
         {
           id: crypto.randomUUID(),
-          name: "Start",
-          type: "n8n-nodes-base.manualTrigger",
+          name: "Webhook",
+          type: "n8n-nodes-base.webhook",
           position: [0, 0],
-          parameters: {},
-          typeVersion: 1,
+          parameters: { path: webhookPath, httpMethod: "GET", responseMode: "onReceived" },
+          typeVersion: 2,
+          webhookId: crypto.randomUUID(),
         },
         {
           id: crypto.randomUUID(),
           name: "Send Email",
           type: "n8n-nodes-base.emailSend",
-          position: [200, 0],
+          position: [300, 0],
           parameters: {
             fromEmail: USER_EMAIL,
             toEmail: to_email,
@@ -975,30 +1045,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         name: `_auto_email_${Date.now()}`,
         nodes: emailNodes,
         connections: {
-          Start: {
+          Webhook: {
             main: [[{ node: "Send Email", type: "main", index: 0 }]],
           },
         },
         settings: {},
       });
       const wfId = emailWorkflow.data.id;
-      // Try to execute the email workflow
-      let executionResult = "created but could not auto-execute";
+      let executionResult = "created";
+
+      // Activate and trigger via webhook
       try {
-        const execResponse = await n8nClient.post("/api/v1/executions", {
-          workflowId: wfId,
-        });
-        executionResult = `executed (ID: ${execResponse.data?.data?.id || execResponse.data?.id || "unknown"})`;
+        // Activate
+        try {
+          await n8nClient.post(`/api/v1/workflows/${wfId}/activate`);
+        } catch {
+          const wf = (await n8nClient.get(`/api/v1/workflows/${wfId}`)).data;
+          wf.active = true;
+          await n8nClient.put(`/api/v1/workflows/${wfId}`, {
+            name: wf.name, nodes: wf.nodes, connections: wf.connections,
+            settings: wf.settings || {}, active: true,
+          });
+        }
+
+        // Wait for webhook registration
+        await new Promise(r => setTimeout(r, 1500));
+
+        // Trigger
+        const webhookUrl = `${N8N_BASE_URL}/webhook/${webhookPath}`;
+        await axios.get(webhookUrl);
+        executionResult = "sent successfully";
       } catch (execErr) {
-        executionResult = `created but execution failed: ${execErr.response?.data?.message || execErr.message}. Open the workflow in n8n UI and run manually.`;
+        executionResult = `created but execution failed: ${execErr.response?.data?.message || execErr.message}`;
       }
-      // Clean up: delete the temporary workflow
+
+      // Cleanup
       try {
+        await n8nClient.post(`/api/v1/workflows/${wfId}/deactivate`).catch(() => {});
         await n8nClient.delete(`/api/v1/workflows/${wfId}`);
         executionResult += " (temp workflow cleaned up)";
       } catch {
         executionResult += ` (temp workflow ${wfId} remains - delete manually)`;
       }
+
       return {
         content: [
           {
