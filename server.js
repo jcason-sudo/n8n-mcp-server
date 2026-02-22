@@ -1149,17 +1149,18 @@ const httpServer = createServer(async (req, res) => {
     // POST /mcp - handle JSON-RPC messages (initialize, tool calls, etc.)
     if (req.method === "POST") {
       const sessionId = req.headers["mcp-session-id"];
-      let transport = streamableTransports.get(sessionId);
+      let transport = sessionId ? streamableTransports.get(sessionId) : null;
 
       if (!transport) {
-        // New session - create transport and server
+        // New session or reconnecting client - create transport and server
+        // Use the client's session ID if provided (allows reconnection after restart)
         transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => crypto.randomUUID(),
+          sessionIdGenerator: sessionId ? () => sessionId : () => crypto.randomUUID(),
           enableJsonResponse: true,
         });
 
         const serverInstance = new Server(
-          { name: "n8n-mcp-server", version: "2.1.0" },
+          { name: "n8n-mcp-server", version: "2.3.1" },
           { capabilities: { tools: {} } }
         );
         registerHandlers(serverInstance);
@@ -1167,14 +1168,16 @@ const httpServer = createServer(async (req, res) => {
         transport.onclose = () => {
           const sid = transport.sessionId;
           if (sid) streamableTransports.delete(sid);
-          console.error(`Streamable HTTP session closed`);
+          console.error(`Streamable HTTP session closed: ${sid}`);
         };
 
         await serverInstance.connect(transport);
 
         // Store by session ID after connection
-        if (transport.sessionId) {
-          streamableTransports.set(transport.sessionId, transport);
+        const actualSessionId = transport.sessionId || sessionId;
+        if (actualSessionId) {
+          streamableTransports.set(actualSessionId, transport);
+          console.error(`New session created: ${actualSessionId}`);
         }
       }
 
@@ -1190,7 +1193,26 @@ const httpServer = createServer(async (req, res) => {
     // GET /mcp - SSE stream for server-initiated messages
     if (req.method === "GET") {
       const sessionId = req.headers["mcp-session-id"];
-      const transport = streamableTransports.get(sessionId);
+      let transport = sessionId ? streamableTransports.get(sessionId) : null;
+      if (!transport && sessionId) {
+        // Client reconnecting after server restart - create new transport with same session ID
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => sessionId,
+          enableJsonResponse: true,
+        });
+        const serverInstance = new Server(
+          { name: "n8n-mcp-server", version: "2.3.1" },
+          { capabilities: { tools: {} } }
+        );
+        registerHandlers(serverInstance);
+        transport.onclose = () => {
+          streamableTransports.delete(sessionId);
+          console.error(`Streamable HTTP session closed: ${sessionId}`);
+        };
+        await serverInstance.connect(transport);
+        streamableTransports.set(sessionId, transport);
+        console.error(`Reconnected session via GET: ${sessionId}`);
+      }
       if (transport) {
         await transport.handleRequest(req, res);
       } else {
