@@ -1152,15 +1152,35 @@ const httpServer = createServer(async (req, res) => {
       let transport = sessionId ? streamableTransports.get(sessionId) : null;
 
       if (!transport) {
-        // New session or reconnecting client - create transport and server
-        // Use the client's session ID if provided (allows reconnection after restart)
+        // Check if this is a request with a stale session ID (not an initialize)
+        // Read the body to check the method
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const bodyStr = Buffer.concat(chunks).toString();
+        let body;
+        try { body = JSON.parse(bodyStr); } catch { body = {}; }
+
+        if (sessionId && body.method !== "initialize") {
+          // Stale session - tell client to re-initialize
+          // Return 404 which signals Claude to create a new session
+          console.error(`Stale session ${sessionId}, method: ${body.method} - returning 404`);
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ 
+            jsonrpc: "2.0", 
+            error: { code: -32600, message: "Session expired. Please re-initialize." },
+            id: body.id || null
+          }));
+          return;
+        }
+
+        // New session (initialize request) - create transport and server
         transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: sessionId ? () => sessionId : () => crypto.randomUUID(),
+          sessionIdGenerator: () => crypto.randomUUID(),
           enableJsonResponse: true,
         });
 
         const serverInstance = new Server(
-          { name: "n8n-mcp-server", version: "2.3.1" },
+          { name: "n8n-mcp-server", version: "2.3.3" },
           { capabilities: { tools: {} } }
         );
         registerHandlers(serverInstance);
@@ -1174,11 +1194,25 @@ const httpServer = createServer(async (req, res) => {
         await serverInstance.connect(transport);
 
         // Store by session ID after connection
-        const actualSessionId = transport.sessionId || sessionId;
-        if (actualSessionId) {
-          streamableTransports.set(actualSessionId, transport);
-          console.error(`New session created: ${actualSessionId}`);
+        if (transport.sessionId) {
+          streamableTransports.set(transport.sessionId, transport);
+          console.error(`New session created: ${transport.sessionId}`);
         }
+
+        // Re-create the request with the buffered body for the transport to handle
+        const { Readable } = await import("node:stream");
+        const newReq = Object.assign(Readable.from(Buffer.from(bodyStr)), {
+          method: req.method,
+          url: req.url,
+          headers: req.headers,
+          httpVersion: req.httpVersion,
+        });
+        await transport.handleRequest(newReq, res);
+
+        if (transport.sessionId && !streamableTransports.has(transport.sessionId)) {
+          streamableTransports.set(transport.sessionId, transport);
+        }
+        return;
       }
 
       await transport.handleRequest(req, res);
@@ -1193,31 +1227,13 @@ const httpServer = createServer(async (req, res) => {
     // GET /mcp - SSE stream for server-initiated messages
     if (req.method === "GET") {
       const sessionId = req.headers["mcp-session-id"];
-      let transport = sessionId ? streamableTransports.get(sessionId) : null;
-      if (!transport && sessionId) {
-        // Client reconnecting after server restart - create new transport with same session ID
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => sessionId,
-          enableJsonResponse: true,
-        });
-        const serverInstance = new Server(
-          { name: "n8n-mcp-server", version: "2.3.1" },
-          { capabilities: { tools: {} } }
-        );
-        registerHandlers(serverInstance);
-        transport.onclose = () => {
-          streamableTransports.delete(sessionId);
-          console.error(`Streamable HTTP session closed: ${sessionId}`);
-        };
-        await serverInstance.connect(transport);
-        streamableTransports.set(sessionId, transport);
-        console.error(`Reconnected session via GET: ${sessionId}`);
-      }
+      const transport = sessionId ? streamableTransports.get(sessionId) : null;
       if (transport) {
         await transport.handleRequest(req, res);
       } else {
+        console.error(`GET with unknown session: ${sessionId} - returning 400`);
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "No active session. Send a POST first." }));
+        res.end(JSON.stringify({ error: "Session expired. Please re-initialize." }));
       }
       return;
     }
