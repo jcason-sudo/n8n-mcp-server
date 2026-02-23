@@ -7,6 +7,10 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createServer } from "node:http";
 import crypto from "node:crypto";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+import fs from "node:fs/promises";
+import path from "node:path";
 import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
@@ -15,6 +19,10 @@ const N8N_BASE_URL = process.env.N8N_BASE_URL || "http://localhost:5678";
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
 const USER_EMAIL = process.env.USER_EMAIL || "your-email@example.com";
 const SMTP_CREDENTIAL_ID = process.env.SMTP_CREDENTIAL_ID || "";
+const SHELL_ENABLED = (process.env.SHELL_ENABLED || "true").toLowerCase() === "true";
+const SHELL_WORKING_DIR = process.env.SHELL_WORKING_DIR || process.env.HOME || "/";
+const SHELL_TIMEOUT_MS = parseInt(process.env.SHELL_TIMEOUT_MS || "30000", 10);
+const execAsync = promisify(exec);
 const n8nClient = axios.create({
   baseURL: N8N_BASE_URL,
   headers: {
@@ -343,6 +351,117 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["workflow_id", "from_node", "to_node"],
         },
       },
+      // ============ SERVER SHELL & FILESYSTEM TOOLS ============
+      ...(SHELL_ENABLED ? [
+      {
+        name: "run_command",
+        description: "Execute a shell command on the server. Returns stdout, stderr, and exit code. Use for any CLI operation: git, docker, systemctl, apt, npm, etc.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "Shell command to execute" },
+            working_dir: { type: "string", description: "Working directory (default: SHELL_WORKING_DIR env var)" },
+            timeout_ms: { type: "number", description: "Timeout in milliseconds (default: 30000)" },
+          },
+          required: ["command"],
+        },
+      },
+      {
+        name: "read_file",
+        description: "Read the contents of a file on the server",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file_path: { type: "string", description: "Absolute or relative path to the file" },
+            encoding: { type: "string", description: "File encoding (default: utf-8)", default: "utf-8" },
+          },
+          required: ["file_path"],
+        },
+      },
+      {
+        name: "write_file",
+        description: "Write content to a file on the server. Creates the file if it doesn't exist, overwrites if it does.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file_path: { type: "string", description: "Absolute or relative path to the file" },
+            content: { type: "string", description: "Content to write" },
+            append: { type: "boolean", description: "Append instead of overwrite (default: false)", default: false },
+          },
+          required: ["file_path", "content"],
+        },
+      },
+      {
+        name: "list_directory",
+        description: "List files and directories at a given path with details (size, modified date, type)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            dir_path: { type: "string", description: "Directory path (default: SHELL_WORKING_DIR)" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "create_directory",
+        description: "Create a directory (and parent directories if needed)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            dir_path: { type: "string", description: "Directory path to create" },
+          },
+          required: ["dir_path"],
+        },
+      },
+      {
+        name: "move_file",
+        description: "Move or rename a file or directory",
+        inputSchema: {
+          type: "object",
+          properties: {
+            source: { type: "string", description: "Source path" },
+            destination: { type: "string", description: "Destination path" },
+          },
+          required: ["source", "destination"],
+        },
+      },
+      {
+        name: "copy_file",
+        description: "Copy a file or directory",
+        inputSchema: {
+          type: "object",
+          properties: {
+            source: { type: "string", description: "Source path" },
+            destination: { type: "string", description: "Destination path" },
+            recursive: { type: "boolean", description: "Copy directories recursively (default: false)", default: false },
+          },
+          required: ["source", "destination"],
+        },
+      },
+      {
+        name: "delete_file",
+        description: "Delete a file or directory",
+        inputSchema: {
+          type: "object",
+          properties: {
+            target_path: { type: "string", description: "Path to delete" },
+            recursive: { type: "boolean", description: "Delete directories recursively (default: false)", default: false },
+          },
+          required: ["target_path"],
+        },
+      },
+      {
+        name: "file_info",
+        description: "Get detailed info about a file or directory (size, permissions, owner, modified date)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            target_path: { type: "string", description: "Path to inspect" },
+          },
+          required: ["target_path"],
+        },
+      },
+      ] : []),
     ],
   };
 });
@@ -1038,6 +1157,154 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [{ type: "text", text: `Disconnected "${from_node}" ✕ "${to_node}"` }],
       };
     }
+    // ============ SERVER SHELL & FILESYSTEM ============
+    if (SHELL_ENABLED && name === "run_command") {
+      const { command, working_dir, timeout_ms } = args;
+      const cwd = working_dir || SHELL_WORKING_DIR;
+      const timeout = timeout_ms || SHELL_TIMEOUT_MS;
+      try {
+        const { stdout, stderr } = await execAsync(command, {
+          cwd,
+          timeout,
+          maxBuffer: 10 * 1024 * 1024, // 10MB
+          shell: "/bin/bash",
+        });
+        return {
+          content: [{
+            type: "text",
+            text: `Command: ${command}\nWorking dir: ${cwd}\nExit code: 0\n\n${stdout ? `--- STDOUT ---\n${stdout}` : "(no stdout)"}${stderr ? `\n\n--- STDERR ---\n${stderr}` : ""}`,
+          }],
+        };
+      } catch (execErr) {
+        return {
+          content: [{
+            type: "text",
+            text: `Command: ${command}\nWorking dir: ${cwd}\nExit code: ${execErr.code || "unknown"}\n\n${execErr.stdout ? `--- STDOUT ---\n${execErr.stdout}` : "(no stdout)"}${execErr.stderr ? `\n\n--- STDERR ---\n${execErr.stderr}` : ""}${execErr.killed ? "\n\n(Process killed — timeout reached)" : ""}`,
+          }],
+          isError: true,
+        };
+      }
+    }
+    if (SHELL_ENABLED && name === "read_file") {
+      const { file_path: filePath, encoding = "utf-8" } = args;
+      const resolved = path.resolve(SHELL_WORKING_DIR, filePath);
+      const content = await fs.readFile(resolved, encoding);
+      const stats = await fs.stat(resolved);
+      return {
+        content: [{
+          type: "text",
+          text: `File: ${resolved} (${stats.size} bytes)\n\n${content}`,
+        }],
+      };
+    }
+    if (SHELL_ENABLED && name === "write_file") {
+      const { file_path: filePath, content, append = false } = args;
+      const resolved = path.resolve(SHELL_WORKING_DIR, filePath);
+      // Ensure parent directory exists
+      await fs.mkdir(path.dirname(resolved), { recursive: true });
+      if (append) {
+        await fs.appendFile(resolved, content, "utf-8");
+      } else {
+        await fs.writeFile(resolved, content, "utf-8");
+      }
+      const stats = await fs.stat(resolved);
+      return {
+        content: [{
+          type: "text",
+          text: `${append ? "Appended to" : "Wrote"} ${resolved} (${stats.size} bytes)`,
+        }],
+      };
+    }
+    if (SHELL_ENABLED && name === "list_directory") {
+      const { dir_path } = args;
+      const resolved = path.resolve(SHELL_WORKING_DIR, dir_path || SHELL_WORKING_DIR);
+      const entries = await fs.readdir(resolved, { withFileTypes: true });
+      const details = await Promise.all(
+        entries.map(async (entry) => {
+          const fullPath = path.join(resolved, entry.name);
+          try {
+            const stats = await fs.stat(fullPath);
+            return {
+              name: entry.name,
+              type: entry.isDirectory() ? "directory" : entry.isSymbolicLink() ? "symlink" : "file",
+              size: stats.size,
+              modified: stats.mtime.toISOString(),
+            };
+          } catch {
+            return { name: entry.name, type: "unknown", size: 0, modified: null };
+          }
+        })
+      );
+      return {
+        content: [{
+          type: "text",
+          text: `Directory: ${resolved}\nEntries: ${details.length}\n\n${JSON.stringify(details, null, 2)}`,
+        }],
+      };
+    }
+    if (SHELL_ENABLED && name === "create_directory") {
+      const { dir_path } = args;
+      const resolved = path.resolve(SHELL_WORKING_DIR, dir_path);
+      await fs.mkdir(resolved, { recursive: true });
+      return {
+        content: [{ type: "text", text: `Created directory: ${resolved}` }],
+      };
+    }
+    if (SHELL_ENABLED && name === "move_file") {
+      const { source, destination } = args;
+      const src = path.resolve(SHELL_WORKING_DIR, source);
+      const dst = path.resolve(SHELL_WORKING_DIR, destination);
+      await fs.rename(src, dst);
+      return {
+        content: [{ type: "text", text: `Moved: ${src} → ${dst}` }],
+      };
+    }
+    if (SHELL_ENABLED && name === "copy_file") {
+      const { source, destination, recursive = false } = args;
+      const src = path.resolve(SHELL_WORKING_DIR, source);
+      const dst = path.resolve(SHELL_WORKING_DIR, destination);
+      if (recursive) {
+        await fs.cp(src, dst, { recursive: true });
+      } else {
+        await fs.copyFile(src, dst);
+      }
+      return {
+        content: [{ type: "text", text: `Copied: ${src} → ${dst}` }],
+      };
+    }
+    if (SHELL_ENABLED && name === "delete_file") {
+      const { target_path, recursive = false } = args;
+      const resolved = path.resolve(SHELL_WORKING_DIR, target_path);
+      const stats = await fs.stat(resolved);
+      if (stats.isDirectory()) {
+        await fs.rm(resolved, { recursive, force: recursive });
+      } else {
+        await fs.unlink(resolved);
+      }
+      return {
+        content: [{ type: "text", text: `Deleted: ${resolved}` }],
+      };
+    }
+    if (SHELL_ENABLED && name === "file_info") {
+      const { target_path } = args;
+      const resolved = path.resolve(SHELL_WORKING_DIR, target_path);
+      const stats = await fs.stat(resolved);
+      return {
+        content: [{
+          type: "text",
+          text: `Path: ${resolved}\n\n${JSON.stringify({
+            type: stats.isDirectory() ? "directory" : stats.isSymbolicLink() ? "symlink" : "file",
+            size: stats.size,
+            permissions: `0${(stats.mode & 0o777).toString(8)}`,
+            uid: stats.uid,
+            gid: stats.gid,
+            created: stats.birthtime.toISOString(),
+            modified: stats.mtime.toISOString(),
+            accessed: stats.atime.toISOString(),
+          }, null, 2)}`,
+        }],
+      };
+    }
     // ============ EMAIL NOTIFICATIONS ============
     if (name === "send_result_email") {
       const { subject, body, to_email = USER_EMAIL } = args;
@@ -1147,7 +1414,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 } // end registerHandlers
 
-const VERSION = "3.0.0";
+const VERSION = "4.0.0";
 
 // Track active SSE transports by session ID (legacy)
 const sseTransports = new Map();
