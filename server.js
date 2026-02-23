@@ -402,14 +402,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
     // ============ NODE MANAGEMENT ============
-    // Helper: save workflow via PUT with required fields only
+    // Helper: save workflow via PUT, preserving active state and staticData
     async function saveWorkflow(workflow_id, workflow) {
-      return n8nClient.put(`/api/v1/workflows/${workflow_id}`, {
+      const payload = {
         name: workflow.name,
         nodes: workflow.nodes,
         connections: workflow.connections,
         settings: workflow.settings || {},
-      });
+      };
+      // Preserve active state so saving doesn't silently deactivate
+      if (workflow.active !== undefined) {
+        payload.active = workflow.active;
+      }
+      if (workflow.staticData) {
+        payload.staticData = workflow.staticData;
+      }
+      return n8nClient.put(`/api/v1/workflows/${workflow_id}`, payload);
     }
 
     if (name === "add_node_to_workflow") {
@@ -690,14 +698,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // ============ WEBHOOK MANAGEMENT ============
     if (name === "create_webhook") {
       const { workflow_id, path } = args;
+      const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
+      // Check if a webhook node already exists
+      const existing = workflow.nodes.find((n) => n.type.includes("webhook"));
+      if (existing) {
+        // Update the existing webhook node's path
+        existing.parameters = { ...existing.parameters, path };
+        await saveWorkflow(workflow_id, workflow);
+        return {
+          content: [{
+            type: "text",
+            text: `Updated existing webhook node path to "${path}".\n\nURL: ${N8N_BASE_URL}/webhook/${path}\n(Activate the workflow to register the webhook)`,
+          }],
+        };
+      }
+      // Add a new Webhook trigger node
+      const webhookNode = {
+        id: crypto.randomUUID(),
+        name: "Webhook",
+        type: "n8n-nodes-base.webhook",
+        position: [0, 0],
+        parameters: { path, httpMethod: "POST", responseMode: "onReceived" },
+        typeVersion: 2,
+        webhookId: crypto.randomUUID(),
+      };
+      workflow.nodes.push(webhookNode);
+      await saveWorkflow(workflow_id, workflow);
       const webhookUrl = `${N8N_BASE_URL}/webhook/${path}`;
       return {
-        content: [
-          {
-            type: "text",
-            text: `Webhook created:\n\nURL: ${webhookUrl}\nWorkflow ID: ${workflow_id}\n\nAdd a Webhook trigger node with path: ${path}`,
-          },
-        ],
+        content: [{
+          type: "text",
+          text: `Webhook node added to workflow!\n\nURL: ${webhookUrl}\nNode: "Webhook"\n(Activate the workflow to register the webhook)`,
+        }],
       };
     }
     if (name === "list_webhooks") {
@@ -1115,20 +1147,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 } // end registerHandlers
 
+const VERSION = "3.0.0";
+
 // Track active SSE transports by session ID (legacy)
-const transports = new Map();
+const sseTransports = new Map();
 
 // Track Streamable HTTP transports by session ID
 const streamableTransports = new Map();
 
-const httpServer = createServer(async (req, res) => {
-  // Log all requests for debugging
-  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} Headers: ${JSON.stringify(req.headers)}`);
+// Helper: create a new Server+Transport pair for a Streamable HTTP session
+function createStreamableSession() {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => crypto.randomUUID(),
+    enableJsonResponse: true,
+    onsessioninitialized: (sessionId) => {
+      streamableTransports.set(sessionId, transport);
+      console.error(`[session] New Streamable HTTP session: ${sessionId}`);
+    },
+  });
 
-  // CORS headers for Claude.ai
+  const serverInstance = new Server(
+    { name: "n8n-mcp-server", version: VERSION },
+    { capabilities: { tools: {} } }
+  );
+  registerHandlers(serverInstance);
+
+  transport.onclose = () => {
+    const sid = transport.sessionId;
+    if (sid) {
+      streamableTransports.delete(sid);
+      console.error(`[session] Closed: ${sid}`);
+    }
+  };
+
+  return { transport, serverInstance };
+}
+
+const httpServer = createServer(async (req, res) => {
+  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+
+  // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version, Authorization, Last-Event-Id");
   res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
   if (req.method === "OPTIONS") {
@@ -1139,111 +1200,92 @@ const httpServer = createServer(async (req, res) => {
 
   // Health check
   if (req.method === "GET" && req.url === "/health") {
+    let n8nStatus = "unknown";
+    try {
+      await n8nClient.get("/api/v1/workflows?limit=1");
+      n8nStatus = "connected";
+    } catch (e) {
+      n8nStatus = `unreachable: ${e.message}`;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", server: "n8n-mcp-server", version: "2.1.0" }));
+    res.end(JSON.stringify({
+      status: "ok",
+      server: "n8n-mcp-server",
+      version: VERSION,
+      n8n: n8nStatus,
+      sessions: streamableTransports.size,
+    }));
     return;
   }
 
   // ============ Streamable HTTP transport at /mcp ============
   if (req.url === "/mcp") {
-    // POST /mcp - handle JSON-RPC messages (initialize, tool calls, etc.)
+
     if (req.method === "POST") {
       const sessionId = req.headers["mcp-session-id"];
-      let transport = sessionId ? streamableTransports.get(sessionId) : null;
 
-      if (!transport) {
-        // Check if this is a request with a stale session ID (not an initialize)
-        // Read the body to check the method
-        const chunks = [];
-        for await (const chunk of req) chunks.push(chunk);
-        const bodyStr = Buffer.concat(chunks).toString();
-        let body;
-        try { body = JSON.parse(bodyStr); } catch { body = {}; }
-
-        if (sessionId && body.method !== "initialize") {
-          // Stale session - tell client to re-initialize
-          // Return 404 which signals Claude to create a new session
-          console.error(`Stale session ${sessionId}, method: ${body.method} - returning 404`);
-          res.writeHead(404, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ 
-            jsonrpc: "2.0", 
-            error: { code: -32600, message: "Session expired. Please re-initialize." },
-            id: body.id || null
-          }));
+      // Case 1: Existing session — pass request directly (body not consumed)
+      if (sessionId) {
+        const transport = streamableTransports.get(sessionId);
+        if (transport) {
+          await transport.handleRequest(req, res);
           return;
         }
-
-        // New session (initialize request) - create transport and server
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => crypto.randomUUID(),
-          enableJsonResponse: true,
-        });
-
-        const serverInstance = new Server(
-          { name: "n8n-mcp-server", version: "2.3.3" },
-          { capabilities: { tools: {} } }
-        );
-        registerHandlers(serverInstance);
-
-        transport.onclose = () => {
-          const sid = transport.sessionId;
-          if (sid) streamableTransports.delete(sid);
-          console.error(`Streamable HTTP session closed: ${sid}`);
-        };
-
-        await serverInstance.connect(transport);
-
-        // Store by session ID after connection
-        if (transport.sessionId) {
-          streamableTransports.set(transport.sessionId, transport);
-          console.error(`New session created: ${transport.sessionId}`);
-        }
-
-        // Re-create the request with the buffered body for the transport to handle
-        const { Readable } = await import("node:stream");
-        const newReq = Object.assign(Readable.from(Buffer.from(bodyStr)), {
-          method: req.method,
-          url: req.url,
-          headers: req.headers,
-          httpVersion: req.httpVersion,
-        });
-        await transport.handleRequest(newReq, res);
-
-        if (transport.sessionId && !streamableTransports.has(transport.sessionId)) {
-          streamableTransports.set(transport.sessionId, transport);
-        }
+        // Session ID provided but not found — stale/expired session.
+        // Return 404 to tell the client to re-initialize.
+        console.error(`[session] Stale session ${sessionId} — returning 404`);
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Session not found. Please re-initialize." },
+          id: null,
+        }));
         return;
       }
 
-      await transport.handleRequest(req, res);
-
-      // After handling, if a new session was created, store it
-      if (transport.sessionId && !streamableTransports.has(transport.sessionId)) {
-        streamableTransports.set(transport.sessionId, transport);
+      // Case 2: No session ID — must be an initialize request.
+      // Create a new transport+server pair. The SDK validates that the
+      // request is actually an initialize; non-init requests without a
+      // session ID are rejected with 400 by the SDK itself.
+      try {
+        const { transport, serverInstance } = createStreamableSession();
+        await serverInstance.connect(transport);
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        console.error(`[session] Failed to create session: ${err.message}`);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32603, message: `Internal error: ${err.message}` },
+            id: null,
+          }));
+        }
       }
       return;
     }
 
-    // GET /mcp - SSE stream for server-initiated messages
+    // GET /mcp — SSE stream for server-initiated messages
     if (req.method === "GET") {
       const sessionId = req.headers["mcp-session-id"];
       const transport = sessionId ? streamableTransports.get(sessionId) : null;
       if (transport) {
         await transport.handleRequest(req, res);
       } else {
-        console.error(`GET with unknown session: ${sessionId} - returning 400`);
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Session expired. Please re-initialize." }));
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Session not found. Please re-initialize." },
+          id: null,
+        }));
       }
       return;
     }
 
-    // DELETE /mcp - close session (disabled: Claude tends to prematurely close sessions)
+    // DELETE /mcp — acknowledge but keep session alive to avoid premature teardown
     if (req.method === "DELETE") {
-      // Acknowledge the DELETE but don't actually close the session
-      // This prevents Claude's MCP client from tearing down sessions too early
       const sessionId = req.headers["mcp-session-id"];
-      console.error(`DELETE requested for session ${sessionId} - keeping session alive`);
+      console.error(`[session] DELETE requested for ${sessionId} — keeping alive`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok" }));
       return;
@@ -1251,33 +1293,29 @@ const httpServer = createServer(async (req, res) => {
   }
 
   // ============ Legacy SSE transport ============
-  // SSE endpoint - client connects here to establish stream
   if (req.method === "GET" && req.url === "/sse") {
-    console.error("New SSE connection");
+    console.error("[sse] New SSE connection");
     const transport = new SSEServerTransport("/messages", res);
-    transports.set(transport.sessionId, transport);
+    sseTransports.set(transport.sessionId, transport);
 
     transport.onclose = () => {
-      console.error(`SSE session ${transport.sessionId} closed`);
-      transports.delete(transport.sessionId);
+      console.error(`[sse] Session ${transport.sessionId} closed`);
+      sseTransports.delete(transport.sessionId);
     };
 
     const serverInstance = new Server(
-      { name: "n8n-mcp-server", version: "2.1.0" },
+      { name: "n8n-mcp-server", version: VERSION },
       { capabilities: { tools: {} } }
     );
-
     registerHandlers(serverInstance);
-
     await serverInstance.connect(transport);
     return;
   }
 
-  // Message endpoint - client POSTs JSON-RPC messages here
   if (req.method === "POST" && req.url?.startsWith("/messages")) {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const sessionId = url.searchParams.get("sessionId");
-    const transport = transports.get(sessionId);
+    const transport = sseTransports.get(sessionId);
 
     if (!transport) {
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -1294,8 +1332,9 @@ const httpServer = createServer(async (req, res) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.error(`n8n MCP Server v2.1.0 running on port ${PORT}`);
-  console.error(`Streamable HTTP: http://localhost:${PORT}/mcp`);
-  console.error(`Legacy SSE:     http://localhost:${PORT}/sse`);
-  console.error(`Health check:   http://localhost:${PORT}/health`);
+  console.error(`n8n MCP Server v${VERSION} running on port ${PORT}`);
+  console.error(`  n8n target:     ${N8N_BASE_URL}`);
+  console.error(`  Streamable HTTP: http://localhost:${PORT}/mcp`);
+  console.error(`  Legacy SSE:      http://localhost:${PORT}/sse`);
+  console.error(`  Health check:    http://localhost:${PORT}/health`);
 });
