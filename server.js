@@ -22,6 +22,77 @@ const n8nClient = axios.create({
     "Content-Type": "application/json",
   },
 });
+// Shared helper: generates n8n Code node JavaScript for formatting digest emails
+function buildDigestEmailCode(digestTitle) {
+  return [
+    "var articles = $input.all().map(function(i) { return i.json; });",
+    "var now = new Date();",
+    "var days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];",
+    "var months = ['January','February','March','April','May','June','July','August','September','October','November','December'];",
+    "var today = days[now.getDay()] + ', ' + months[now.getMonth()] + ' ' + now.getDate() + ', ' + now.getFullYear();",
+    "var digestTitle = " + JSON.stringify(digestTitle) + ";",
+    "",
+    "if (articles.length === 1 && articles[0]._noArticles) {",
+    "  return [{ json: {",
+    "    emailSubject: digestTitle + ' - ' + today + ' - No new articles',",
+    "    emailBody: '<!DOCTYPE html><html><body style=\"margin:0;padding:0;background:#f4f4f7;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\"><table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"padding:32px 16px;\"><tr><td align=\"center\"><table width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);\"><tr><td style=\"background:#1a1a2e;padding:36px 40px;text-align:center;\"><h1 style=\"margin:0;color:#fff;font-size:24px;\">' + digestTitle + '</h1><p style=\"margin:10px 0 0;color:#8b8fa3;font-size:14px;\">' + today + '</p></td></tr><tr><td style=\"padding:40px;text-align:center;\"><p style=\"color:#6b7280;font-size:16px;\">No relevant articles matched your topics today.</p><p style=\"color:#9ca3af;font-size:14px;margin-top:8px;\">Check back tomorrow for fresh content.</p></td></tr></table></td></tr></table></body></html>'",
+    "  }}];",
+    "}",
+    "",
+    "function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;'); }",
+    "",
+    "function ago(d) {",
+    "  if (!d) return '';",
+    "  var h = Math.floor((Date.now() - new Date(d).getTime()) / 3600000);",
+    "  if (h < 0) h = 0;",
+    "  if (h < 1) return 'Just now';",
+    "  if (h < 24) return h + 'h ago';",
+    "  var dd = Math.floor(h / 24);",
+    "  return dd + 'd ago';",
+    "}",
+    "",
+    "var rows = '';",
+    "for (var i = 0; i < articles.length; i++) {",
+    "  var a = articles[i];",
+    "  var title = esc(a.title || 'Untitled');",
+    "  var link = a.link || '#';",
+    "  var snippet = esc((a.snippet || '').substring(0, 250));",
+    "  var source = esc(a.source || '');",
+    "  var time = ago(a.date);",
+    "  var meta = [source, time].filter(Boolean).join(' \\u00B7 ');",
+    "  rows += '<div style=\"margin-bottom:20px;padding-bottom:20px;' + (i < articles.length - 1 ? 'border-bottom:1px solid #eef0f3;' : '') + '\">';",
+    "  rows += '<a href=\"' + link + '\" style=\"color:#1a1a2e;text-decoration:none;font-size:16px;font-weight:600;line-height:1.4;display:block;\">' + title + '</a>';",
+    "  if (meta) rows += '<p style=\"margin:4px 0 0;color:#6b7280;font-size:12px;letter-spacing:0.3px;\">' + meta + '</p>';",
+    "  if (snippet) rows += '<p style=\"margin:6px 0 0;color:#4b5563;font-size:14px;line-height:1.55;\">' + snippet + '</p>';",
+    "  rows += '</div>';",
+    "}",
+    "",
+    "var count = articles.length;",
+    "var countText = count + ' article' + (count !== 1 ? 's' : '');",
+    "",
+    "var html = '<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head>';",
+    "html += '<body style=\"margin:0;padding:0;background-color:#f4f4f7;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">';",
+    "html += '<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#f4f4f7;padding:32px 16px;\"><tr><td align=\"center\">';",
+    "html += '<table width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);\">';",
+    "// Header",
+    "html += '<tr><td style=\"background-color:#1a1a2e;padding:36px 40px;text-align:center;\">';",
+    "html += '<h1 style=\"margin:0;color:#ffffff;font-size:24px;font-weight:700;letter-spacing:-0.3px;\">' + digestTitle + '</h1>';",
+    "html += '<p style=\"margin:10px 0 0;color:#8b8fa3;font-size:14px;\">' + today + ' \\u00B7 ' + countText + '</p>';",
+    "html += '</td></tr>';",
+    "// Articles",
+    "html += '<tr><td style=\"padding:32px 40px;\">' + rows + '</td></tr>';",
+    "// Footer",
+    "html += '<tr><td style=\"background-color:#f9fafb;padding:20px 40px;text-align:center;border-top:1px solid #eef0f3;\">';",
+    "html += '<p style=\"margin:0;color:#9ca3af;font-size:12px;\">Curated by your n8n automation \\u00B7 Delivered daily</p>';",
+    "html += '</td></tr></table></td></tr></table></body></html>';",
+    "",
+    "return [{ json: {",
+    "  emailSubject: digestTitle + ' - ' + today + ' - ' + countText,",
+    "  emailBody: html",
+    "}}];",
+  ].join("\n");
+}
+
 function registerHandlers(server) {
 // List all available tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -341,6 +412,110 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             to_node: { type: "string", description: "Target node name" },
           },
           required: ["workflow_id", "from_node", "to_node"],
+        },
+      },
+      // ============ Email Digest Pipelines ============
+      {
+        name: "create_rss_email_digest",
+        description: "Create a complete RSS feed email digest workflow. Aggregates multiple RSS feeds, filters by topic keywords, deduplicates, scores for relevance, and sends a professional daily email summary. Creates a ready-to-activate n8n workflow.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            feeds: {
+              type: "array",
+              items: { type: "string" },
+              description: "Array of RSS feed URLs to aggregate (e.g., ['https://techcrunch.com/feed/', 'https://feeds.arstechnica.com/arstechnica/index'])"
+            },
+            topics: {
+              type: "array",
+              items: { type: "string" },
+              description: "Topic keywords for relevance filtering (e.g., ['AI', 'cybersecurity', 'startups']). Articles not matching any topic are excluded."
+            },
+            schedule: {
+              type: "string",
+              description: "Cron expression for digest schedule (default: '0 7 * * *' = daily at 7 AM UTC)"
+            },
+            max_articles: {
+              type: "number",
+              description: "Maximum articles per digest email (default: 20)"
+            },
+            to_email: {
+              type: "string",
+              description: "Recipient email address (defaults to USER_EMAIL env var)"
+            },
+          },
+          required: ["feeds", "topics"],
+        },
+      },
+      {
+        name: "create_linkedin_email_digest",
+        description: "Create a LinkedIn content email digest workflow. Fetches LinkedIn posts/articles via API, filters by keyword relevance, and sends a professional daily email summary. Requires LinkedIn API credentials (httpHeaderAuth) configured in n8n.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            keywords: {
+              type: "array",
+              items: { type: "string" },
+              description: "Keywords to filter LinkedIn content for relevance (e.g., ['AI', 'leadership', 'venture capital'])"
+            },
+            organization_ids: {
+              type: "array",
+              items: { type: "string" },
+              description: "LinkedIn organization/company IDs to follow (numeric IDs from LinkedIn URLs)"
+            },
+            credential_id: {
+              type: "string",
+              description: "n8n credential ID for LinkedIn API access (httpHeaderAuth type with Bearer token)"
+            },
+            schedule: {
+              type: "string",
+              description: "Cron expression (default: '0 7 * * *' = daily at 7 AM UTC)"
+            },
+            max_posts: {
+              type: "number",
+              description: "Max posts per digest (default: 15)"
+            },
+            to_email: {
+              type: "string",
+              description: "Recipient email address"
+            },
+          },
+          required: ["keywords"],
+        },
+      },
+      {
+        name: "create_x_email_digest",
+        description: "Create a Twitter/X content email digest workflow. Searches X API v2 for recent posts by keywords, filters by relevance and engagement metrics, and sends a professional daily email summary. Requires X API credentials (httpHeaderAuth with Bearer token) configured in n8n.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            keywords: {
+              type: "array",
+              items: { type: "string" },
+              description: "Keywords/search terms for X API (e.g., ['AI agents', 'LLM', 'foundation models']). Combined with OR logic."
+            },
+            credential_id: {
+              type: "string",
+              description: "n8n credential ID for X API access (httpHeaderAuth type with 'Authorization: Bearer YOUR_TOKEN')"
+            },
+            min_likes: {
+              type: "number",
+              description: "Minimum likes to include a post (default: 5). Helps filter out noise."
+            },
+            schedule: {
+              type: "string",
+              description: "Cron expression (default: '0 7 * * *' = daily at 7 AM UTC)"
+            },
+            max_posts: {
+              type: "number",
+              description: "Max posts per digest (default: 20)"
+            },
+            to_email: {
+              type: "string",
+              description: "Recipient email address"
+            },
+          },
+          required: ["keywords"],
         },
       },
     ],
@@ -1097,6 +1272,600 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     }
+    // ============ EMAIL DIGEST PIPELINES ============
+    if (name === "create_rss_email_digest") {
+      const {
+        feeds = [],
+        topics = [],
+        schedule = "0 7 * * *",
+        max_articles = 20,
+        to_email = USER_EMAIL,
+      } = args;
+
+      if (feeds.length === 0) throw new Error("At least one RSS feed URL is required");
+
+      const feedUrlsCode = [
+        "var feeds = " + JSON.stringify(feeds) + ";",
+        "return feeds.map(function(url) { return { json: { feedUrl: url } }; });",
+      ].join("\n");
+
+      const filterScoreCode = [
+        "var topics = " + JSON.stringify(topics) + ";",
+        "var maxArticles = " + max_articles + ";",
+        "",
+        "var allItems = $input.all().map(function(i) { return i.json; });",
+        "",
+        "// Deduplicate by link URL",
+        "var seen = {};",
+        "var unique = allItems.filter(function(a) {",
+        "  var key = (a.link || a.guid || a.title || '').toLowerCase().trim();",
+        "  if (!key || seen[key]) return false;",
+        "  seen[key] = true;",
+        "  return true;",
+        "});",
+        "",
+        "// Score articles by topic relevance",
+        "function scoreArticle(a) {",
+        "  var title = (a.title || '').toLowerCase();",
+        "  var body = (a.contentSnippet || a.description || a.content || '').toLowerCase();",
+        "  var cats = Array.isArray(a.categories) ? a.categories.join(' ').toLowerCase() : '';",
+        "  var text = title + ' ' + body + ' ' + cats;",
+        "  var s = 0;",
+        "  if (topics.length === 0) return 1;",
+        "  for (var i = 0; i < topics.length; i++) {",
+        "    var t = topics[i].toLowerCase();",
+        "    if (title.indexOf(t) !== -1) { s += 15; }",
+        "    else if (cats.indexOf(t) !== -1) { s += 8; }",
+        "    else if (text.indexOf(t) !== -1) { s += 5; }",
+        "  }",
+        "  // Freshness bonus",
+        "  var d = a.isoDate || a.pubDate;",
+        "  if (d) {",
+        "    var hrs = (Date.now() - new Date(d).getTime()) / 3600000;",
+        "    if (hrs < 6) s += 5;",
+        "    else if (hrs < 12) s += 3;",
+        "    else if (hrs < 24) s += 1;",
+        "  }",
+        "  return s;",
+        "}",
+        "",
+        "var scored = unique",
+        "  .map(function(a) {",
+        "    return {",
+        "      title: a.title || 'Untitled',",
+        "      snippet: (a.contentSnippet || a.description || '').substring(0, 250),",
+        "      link: a.link || '',",
+        "      date: a.isoDate || a.pubDate || '',",
+        "      source: a.creator || a['dc:creator'] || '',",
+        "      _score: scoreArticle(a)",
+        "    };",
+        "  })",
+        "  .filter(function(a) { return a._score > 0; })",
+        "  .sort(function(a, b) { return b._score - a._score; })",
+        "  .slice(0, maxArticles);",
+        "",
+        "if (scored.length === 0) {",
+        "  return [{ json: { _noArticles: true } }];",
+        "}",
+        "return scored.map(function(a) { return { json: a }; });",
+      ].join("\n");
+
+      const formatEmailCode = buildDigestEmailCode("RSS Digest");
+
+      const nodes = [
+        {
+          id: crypto.randomUUID(),
+          name: "Schedule Trigger",
+          type: "n8n-nodes-base.scheduleTrigger",
+          position: [0, 300],
+          parameters: {
+            rule: { interval: [{ field: "cronExpression", expression: schedule }] },
+          },
+          typeVersion: 1.2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Set Feed URLs",
+          type: "n8n-nodes-base.code",
+          position: [220, 300],
+          parameters: { jsCode: feedUrlsCode },
+          typeVersion: 2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Read RSS Feed",
+          type: "n8n-nodes-base.rssFeedRead",
+          position: [440, 300],
+          parameters: { url: "={{ $json.feedUrl }}" },
+          typeVersion: 1,
+          onError: "continueRegularOutput",
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Filter and Score",
+          type: "n8n-nodes-base.code",
+          position: [660, 300],
+          parameters: { mode: "runOnceForAllItems", jsCode: filterScoreCode },
+          typeVersion: 2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Format Digest Email",
+          type: "n8n-nodes-base.code",
+          position: [880, 300],
+          parameters: { mode: "runOnceForAllItems", jsCode: formatEmailCode },
+          typeVersion: 2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Send Digest",
+          type: "n8n-nodes-base.emailSend",
+          position: [1100, 300],
+          parameters: {
+            fromEmail: USER_EMAIL,
+            toEmail: to_email,
+            subject: "={{ $json.emailSubject }}",
+            html: "={{ $json.emailBody }}",
+          },
+          typeVersion: 1,
+          ...(SMTP_CREDENTIAL_ID ? { credentials: { smtp: { id: SMTP_CREDENTIAL_ID, name: "SMTP account" } } } : {}),
+        },
+      ];
+
+      const connections = {
+        "Schedule Trigger": { main: [[{ node: "Set Feed URLs", type: "main", index: 0 }]] },
+        "Set Feed URLs": { main: [[{ node: "Read RSS Feed", type: "main", index: 0 }]] },
+        "Read RSS Feed": { main: [[{ node: "Filter and Score", type: "main", index: 0 }]] },
+        "Filter and Score": { main: [[{ node: "Format Digest Email", type: "main", index: 0 }]] },
+        "Format Digest Email": { main: [[{ node: "Send Digest", type: "main", index: 0 }]] },
+      };
+
+      const response = await n8nClient.post("/api/v1/workflows", {
+        name: "RSS Daily Digest",
+        nodes,
+        connections,
+        settings: {},
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: `Created RSS Daily Digest workflow!\n\nID: ${response.data.id}\nSchedule: ${schedule} (cron)\nFeeds: ${feeds.length} sources\nTopics: ${topics.join(", ")}\nMax articles: ${max_articles}\nRecipient: ${to_email}\n\nPipeline: Schedule \u2192 Fetch Feeds \u2192 Read RSS \u2192 Filter & Score \u2192 Format Email \u2192 Send\n\nNext step: Activate the workflow with activate_workflow to start receiving daily digests.${!SMTP_CREDENTIAL_ID ? "\n\n\u26A0\uFE0F Warning: No SMTP_CREDENTIAL_ID configured. Set it in .env or attach SMTP credentials to the Send Digest node." : ""}`,
+        }],
+      };
+    }
+
+    if (name === "create_linkedin_email_digest") {
+      const {
+        keywords = [],
+        organization_ids = [],
+        credential_id = "",
+        schedule = "0 7 * * *",
+        max_posts = 15,
+        to_email = USER_EMAIL,
+      } = args;
+
+      if (keywords.length === 0) throw new Error("At least one keyword is required");
+
+      const buildQueryCode = [
+        "var orgIds = " + JSON.stringify(organization_ids) + ";",
+        "var keywords = " + JSON.stringify(keywords) + ";",
+        "",
+        "// Build LinkedIn API request parameters",
+        "var requests = [];",
+        "if (orgIds.length > 0) {",
+        "  // Fetch posts from specific organizations",
+        "  for (var i = 0; i < orgIds.length; i++) {",
+        "    requests.push({",
+        "      json: {",
+        "        apiUrl: 'https://api.linkedin.com/v2/ugcPosts?q=authors&authors=List(urn%3Ali%3Aorganization%3A' + orgIds[i] + ')&count=50',",
+        "        source: 'org_' + orgIds[i]",
+        "      }",
+        "    });",
+        "  }",
+        "} else {",
+        "  // Use LinkedIn search/feed endpoint with keywords",
+        "  requests.push({",
+        "    json: {",
+        "      apiUrl: 'https://api.linkedin.com/v2/ugcPosts?q=authors&count=100',",
+        "      source: 'feed'",
+        "    }",
+        "  });",
+        "}",
+        "return requests;",
+      ].join("\n");
+
+      const filterScoreCode = [
+        "var keywords = " + JSON.stringify(keywords) + ";",
+        "var maxPosts = " + max_posts + ";",
+        "",
+        "var allItems = $input.all().map(function(i) { return i.json; });",
+        "",
+        "// Parse LinkedIn API response - handle nested structure",
+        "var posts = [];",
+        "for (var i = 0; i < allItems.length; i++) {",
+        "  var item = allItems[i];",
+        "  // LinkedIn API returns elements array or direct post data",
+        "  var elements = item.elements || (item.data ? item.data.elements : null) || [item];",
+        "  if (!Array.isArray(elements)) elements = [elements];",
+        "  for (var j = 0; j < elements.length; j++) {",
+        "    var el = elements[j];",
+        "    var text = '';",
+        "    if (el.specificContent && el.specificContent['com.linkedin.ugc.ShareContent']) {",
+        "      var shareContent = el.specificContent['com.linkedin.ugc.ShareContent'];",
+        "      text = (shareContent.shareCommentary || {}).text || '';",
+        "    } else if (el.text) {",
+        "      text = typeof el.text === 'string' ? el.text : (el.text.text || '');",
+        "    } else if (el.commentary) {",
+        "      text = el.commentary;",
+        "    }",
+        "    if (!text) continue;",
+        "    posts.push({",
+        "      text: text,",
+        "      author: el.author || el.actor || '',",
+        "      created: el.created ? el.created.time : (el.createdAt || Date.now()),",
+        "      id: el.id || el.urn || '',",
+        "      url: el.id ? 'https://www.linkedin.com/feed/update/' + el.id : ''",
+        "    });",
+        "  }",
+        "}",
+        "",
+        "// Deduplicate",
+        "var seen = {};",
+        "posts = posts.filter(function(p) {",
+        "  var key = p.id || p.text.substring(0, 100);",
+        "  if (seen[key]) return false;",
+        "  seen[key] = true;",
+        "  return true;",
+        "});",
+        "",
+        "// Score by keyword relevance",
+        "function score(post) {",
+        "  var t = post.text.toLowerCase();",
+        "  var s = 0;",
+        "  for (var i = 0; i < keywords.length; i++) {",
+        "    var kw = keywords[i].toLowerCase();",
+        "    if (t.indexOf(kw) !== -1) s += 10;",
+        "  }",
+        "  // Freshness bonus",
+        "  var hrs = (Date.now() - post.created) / 3600000;",
+        "  if (hrs < 12) s += 5;",
+        "  else if (hrs < 24) s += 3;",
+        "  return s;",
+        "}",
+        "",
+        "var scored = posts",
+        "  .map(function(p) {",
+        "    var firstLine = p.text.split('\\n')[0] || 'LinkedIn Post';",
+        "    return {",
+        "      title: firstLine.length > 100 ? firstLine.substring(0, 100) + '...' : firstLine,",
+        "      snippet: p.text.substring(0, 250),",
+        "      link: p.url,",
+        "      date: new Date(p.created).toISOString(),",
+        "      source: 'LinkedIn',",
+        "      _score: score(p)",
+        "    };",
+        "  })",
+        "  .filter(function(a) { return a._score > 0; })",
+        "  .sort(function(a, b) { return b._score - a._score; })",
+        "  .slice(0, maxPosts);",
+        "",
+        "if (scored.length === 0) {",
+        "  return [{ json: { _noArticles: true } }];",
+        "}",
+        "return scored.map(function(a) { return { json: a }; });",
+      ].join("\n");
+
+      const formatEmailCode = buildDigestEmailCode("LinkedIn Digest");
+
+      const nodes = [
+        {
+          id: crypto.randomUUID(),
+          name: "Schedule Trigger",
+          type: "n8n-nodes-base.scheduleTrigger",
+          position: [0, 300],
+          parameters: {
+            rule: { interval: [{ field: "cronExpression", expression: schedule }] },
+          },
+          typeVersion: 1.2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Build LinkedIn Query",
+          type: "n8n-nodes-base.code",
+          position: [220, 300],
+          parameters: { jsCode: buildQueryCode },
+          typeVersion: 2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Fetch LinkedIn Posts",
+          type: "n8n-nodes-base.httpRequest",
+          position: [440, 300],
+          parameters: {
+            method: "GET",
+            url: "={{ $json.apiUrl }}",
+            authentication: "genericCredentialType",
+            genericAuthType: "httpHeaderAuth",
+            options: {},
+          },
+          typeVersion: 3,
+          ...(credential_id ? { credentials: { httpHeaderAuth: { id: credential_id, name: "LinkedIn API" } } } : {}),
+          onError: "continueRegularOutput",
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Filter and Score",
+          type: "n8n-nodes-base.code",
+          position: [660, 300],
+          parameters: { mode: "runOnceForAllItems", jsCode: filterScoreCode },
+          typeVersion: 2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Format Digest Email",
+          type: "n8n-nodes-base.code",
+          position: [880, 300],
+          parameters: { mode: "runOnceForAllItems", jsCode: formatEmailCode },
+          typeVersion: 2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Send Digest",
+          type: "n8n-nodes-base.emailSend",
+          position: [1100, 300],
+          parameters: {
+            fromEmail: USER_EMAIL,
+            toEmail: to_email,
+            subject: "={{ $json.emailSubject }}",
+            html: "={{ $json.emailBody }}",
+          },
+          typeVersion: 1,
+          ...(SMTP_CREDENTIAL_ID ? { credentials: { smtp: { id: SMTP_CREDENTIAL_ID, name: "SMTP account" } } } : {}),
+        },
+      ];
+
+      const connections = {
+        "Schedule Trigger": { main: [[{ node: "Build LinkedIn Query", type: "main", index: 0 }]] },
+        "Build LinkedIn Query": { main: [[{ node: "Fetch LinkedIn Posts", type: "main", index: 0 }]] },
+        "Fetch LinkedIn Posts": { main: [[{ node: "Filter and Score", type: "main", index: 0 }]] },
+        "Filter and Score": { main: [[{ node: "Format Digest Email", type: "main", index: 0 }]] },
+        "Format Digest Email": { main: [[{ node: "Send Digest", type: "main", index: 0 }]] },
+      };
+
+      const response = await n8nClient.post("/api/v1/workflows", {
+        name: "LinkedIn Daily Digest",
+        nodes,
+        connections,
+        settings: {},
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: `Created LinkedIn Daily Digest workflow!\n\nID: ${response.data.id}\nSchedule: ${schedule} (cron)\nKeywords: ${keywords.join(", ")}\nOrganizations: ${organization_ids.length || "user feed"}\nMax posts: ${max_posts}\nRecipient: ${to_email}\n\nPipeline: Schedule \u2192 Build Query \u2192 Fetch Posts \u2192 Filter & Score \u2192 Format Email \u2192 Send\n\nNext step: Activate the workflow with activate_workflow.\n\nRequirements:\n- LinkedIn API credential (httpHeaderAuth) with Bearer token in n8n\n- LinkedIn Marketing API or Content API access${!credential_id ? "\n\n\u26A0\uFE0F Warning: No credential_id provided. Attach LinkedIn API credentials to the Fetch LinkedIn Posts node." : ""}`,
+        }],
+      };
+    }
+
+    if (name === "create_x_email_digest") {
+      const {
+        keywords = [],
+        credential_id = "",
+        min_likes = 5,
+        schedule = "0 7 * * *",
+        max_posts = 20,
+        to_email = USER_EMAIL,
+      } = args;
+
+      if (keywords.length === 0) throw new Error("At least one keyword is required");
+
+      // Build X API search query: (keyword1 OR keyword2) -is:retweet lang:en
+      const searchQuery = "(" + keywords.join(" OR ") + ") -is:retweet lang:en";
+
+      const buildSearchCode = [
+        "// X API v2 search query",
+        "return [{ json: {",
+        "  searchQuery: " + JSON.stringify(searchQuery) + ",",
+        "  apiUrl: 'https://api.twitter.com/2/tweets/search/recent'",
+        "}}];",
+      ].join("\n");
+
+      const filterScoreCode = [
+        "var keywords = " + JSON.stringify(keywords) + ";",
+        "var maxPosts = " + max_posts + ";",
+        "var minLikes = " + min_likes + ";",
+        "",
+        "var allItems = $input.all().map(function(i) { return i.json; });",
+        "",
+        "// Parse X API v2 response",
+        "var tweets = [];",
+        "var usersMap = {};",
+        "for (var i = 0; i < allItems.length; i++) {",
+        "  var item = allItems[i];",
+        "  // Build users lookup from includes",
+        "  var includes = item.includes || {};",
+        "  var users = includes.users || [];",
+        "  for (var u = 0; u < users.length; u++) {",
+        "    usersMap[users[u].id] = users[u];",
+        "  }",
+        "  // Extract tweets from data array",
+        "  var data = item.data || [];",
+        "  if (!Array.isArray(data)) data = [data];",
+        "  for (var j = 0; j < data.length; j++) {",
+        "    tweets.push(data[j]);",
+        "  }",
+        "}",
+        "",
+        "// Deduplicate by tweet ID",
+        "var seen = {};",
+        "tweets = tweets.filter(function(t) {",
+        "  if (!t.id || seen[t.id]) return false;",
+        "  seen[t.id] = true;",
+        "  return true;",
+        "});",
+        "",
+        "// Filter by minimum engagement and score by relevance",
+        "function score(tweet) {",
+        "  var text = (tweet.text || '').toLowerCase();",
+        "  var metrics = tweet.public_metrics || {};",
+        "  var likes = metrics.like_count || 0;",
+        "  var retweets = metrics.retweet_count || 0;",
+        "  var replies = metrics.reply_count || 0;",
+        "",
+        "  // Filter: must meet minimum engagement",
+        "  if (likes < minLikes) return -1;",
+        "",
+        "  var s = 0;",
+        "  // Keyword relevance",
+        "  for (var i = 0; i < keywords.length; i++) {",
+        "    var kw = keywords[i].toLowerCase();",
+        "    if (text.indexOf(kw) !== -1) s += 10;",
+        "  }",
+        "  // Engagement score (log scale to avoid mega-viral domination)",
+        "  s += Math.min(Math.log2(likes + 1) * 2, 20);",
+        "  s += Math.min(Math.log2(retweets + 1) * 1.5, 10);",
+        "  s += Math.min(Math.log2(replies + 1), 5);",
+        "",
+        "  // Freshness bonus",
+        "  if (tweet.created_at) {",
+        "    var hrs = (Date.now() - new Date(tweet.created_at).getTime()) / 3600000;",
+        "    if (hrs < 6) s += 5;",
+        "    else if (hrs < 12) s += 3;",
+        "  }",
+        "  return s;",
+        "}",
+        "",
+        "var scored = tweets",
+        "  .map(function(t) {",
+        "    var author = usersMap[t.author_id] || {};",
+        "    var authorDisplay = author.name ? author.name + ' @' + author.username : '';",
+        "    var metrics = t.public_metrics || {};",
+        "    var engagement = [];",
+        "    if (metrics.like_count) engagement.push(metrics.like_count + ' likes');",
+        "    if (metrics.retweet_count) engagement.push(metrics.retweet_count + ' RTs');",
+        "    if (metrics.reply_count) engagement.push(metrics.reply_count + ' replies');",
+        "    return {",
+        "      title: (t.text || '').substring(0, 120),",
+        "      snippet: (t.text || '') + (engagement.length ? '\\n' + engagement.join(' \\u00B7 ') : ''),",
+        "      link: 'https://x.com/' + (author.username || 'i') + '/status/' + t.id,",
+        "      date: t.created_at || '',",
+        "      source: authorDisplay || 'X',",
+        "      _score: score(t)",
+        "    };",
+        "  })",
+        "  .filter(function(a) { return a._score > 0; })",
+        "  .sort(function(a, b) { return b._score - a._score; })",
+        "  .slice(0, maxPosts);",
+        "",
+        "if (scored.length === 0) {",
+        "  return [{ json: { _noArticles: true } }];",
+        "}",
+        "return scored.map(function(a) { return { json: a }; });",
+      ].join("\n");
+
+      const formatEmailCode = buildDigestEmailCode("X / Twitter Digest");
+
+      const nodes = [
+        {
+          id: crypto.randomUUID(),
+          name: "Schedule Trigger",
+          type: "n8n-nodes-base.scheduleTrigger",
+          position: [0, 300],
+          parameters: {
+            rule: { interval: [{ field: "cronExpression", expression: schedule }] },
+          },
+          typeVersion: 1.2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Build X Search",
+          type: "n8n-nodes-base.code",
+          position: [220, 300],
+          parameters: { jsCode: buildSearchCode },
+          typeVersion: 2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Search X Posts",
+          type: "n8n-nodes-base.httpRequest",
+          position: [440, 300],
+          parameters: {
+            method: "GET",
+            url: "={{ $json.apiUrl }}",
+            authentication: "genericCredentialType",
+            genericAuthType: "httpHeaderAuth",
+            sendQuery: true,
+            queryParameters: {
+              parameters: [
+                { name: "query", value: "={{ $json.searchQuery }}" },
+                { name: "max_results", value: "100" },
+                { name: "tweet.fields", value: "created_at,public_metrics,author_id,text" },
+                { name: "expansions", value: "author_id" },
+                { name: "user.fields", value: "name,username" },
+              ],
+            },
+            options: {},
+          },
+          typeVersion: 3,
+          ...(credential_id ? { credentials: { httpHeaderAuth: { id: credential_id, name: "X API" } } } : {}),
+          onError: "continueRegularOutput",
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Filter and Score",
+          type: "n8n-nodes-base.code",
+          position: [660, 300],
+          parameters: { mode: "runOnceForAllItems", jsCode: filterScoreCode },
+          typeVersion: 2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Format Digest Email",
+          type: "n8n-nodes-base.code",
+          position: [880, 300],
+          parameters: { mode: "runOnceForAllItems", jsCode: formatEmailCode },
+          typeVersion: 2,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: "Send Digest",
+          type: "n8n-nodes-base.emailSend",
+          position: [1100, 300],
+          parameters: {
+            fromEmail: USER_EMAIL,
+            toEmail: to_email,
+            subject: "={{ $json.emailSubject }}",
+            html: "={{ $json.emailBody }}",
+          },
+          typeVersion: 1,
+          ...(SMTP_CREDENTIAL_ID ? { credentials: { smtp: { id: SMTP_CREDENTIAL_ID, name: "SMTP account" } } } : {}),
+        },
+      ];
+
+      const connections = {
+        "Schedule Trigger": { main: [[{ node: "Build X Search", type: "main", index: 0 }]] },
+        "Build X Search": { main: [[{ node: "Search X Posts", type: "main", index: 0 }]] },
+        "Search X Posts": { main: [[{ node: "Filter and Score", type: "main", index: 0 }]] },
+        "Filter and Score": { main: [[{ node: "Format Digest Email", type: "main", index: 0 }]] },
+        "Format Digest Email": { main: [[{ node: "Send Digest", type: "main", index: 0 }]] },
+      };
+
+      const response = await n8nClient.post("/api/v1/workflows", {
+        name: "X Daily Digest",
+        nodes,
+        connections,
+        settings: {},
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: `Created X Daily Digest workflow!\n\nID: ${response.data.id}\nSchedule: ${schedule} (cron)\nSearch: ${searchQuery}\nMin likes: ${min_likes}\nMax posts: ${max_posts}\nRecipient: ${to_email}\n\nPipeline: Schedule \u2192 Build Query \u2192 Search X API \u2192 Filter & Score \u2192 Format Email \u2192 Send\n\nNext step: Activate the workflow with activate_workflow.\n\nRequirements:\n- X API v2 credentials (httpHeaderAuth with 'Authorization: Bearer YOUR_TOKEN') in n8n\n- X API Basic or Pro access for search endpoint${!credential_id ? "\n\n\u26A0\uFE0F Warning: No credential_id provided. Attach X API credentials to the Search X Posts node." : ""}`,
+        }],
+      };
+    }
+
     return {
       content: [{ type: "text", text: `Unknown tool: ${name}` }],
       isError: true,
