@@ -42,6 +42,7 @@ const metrics = {
   mcp_errors_total: 0,
   mcp_rate_limited_total: 0,
   mcp_validation_failures_total: 0,
+  evictions_total: 0,
 };
 
 const TOOL_INPUT_SCHEMAS = {
@@ -1400,6 +1401,7 @@ const CONCURRENCY_HOLD_MS = Number.parseInt(process.env.CONCURRENCY_HOLD_MS || "
 const sessionTimestamps = new Map(); // sessionId → creation time
 const sessionLastActivity = new Map(); // sessionId → last activity
 const sessionInflightCounts = new Map(); // sessionId → in-flight request count
+const tokenSessionIndex = new Map(); // tokenHash -> sessionId
 
 function writeJsonRpcError(res, {
   code,
@@ -1453,8 +1455,28 @@ function releaseInflight(sessionId) {
   sessionInflightCounts.set(sessionId, current - 1);
 }
 
-// Evict expired sessions periodically
-setInterval(() => {
+function extractBearerToken(req) {
+  const authHeader = req.headers["authorization"] || "";
+  if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+    return authHeader.slice(7);
+  }
+  return "";
+}
+
+function tokenHash(token) {
+  if (!token) return "";
+  return crypto.createHash("sha256").update(token).digest("hex").slice(0, 16);
+}
+
+function removeSessionMappings(sid) {
+  for (const [hash, mappedSid] of tokenSessionIndex.entries()) {
+    if (mappedSid === sid) {
+      tokenSessionIndex.delete(hash);
+    }
+  }
+}
+
+function evictExpiredSessions() {
   const now = Date.now();
   for (const [sid, created] of sessionTimestamps) {
     const lastActivity = sessionLastActivity.get(sid) || created;
@@ -1469,9 +1491,23 @@ setInterval(() => {
       sessionTimestamps.delete(sid);
       sessionLastActivity.delete(sid);
       sessionInflightCounts.delete(sid);
+      removeSessionMappings(sid);
+      metrics.evictions_total += 1;
     }
   }
+}
+
+function totalInflight() {
+  let sum = 0;
+  for (const v of sessionInflightCounts.values()) sum += v;
+  return sum;
+}
+
+// Evict expired sessions periodically
+setInterval(() => {
+  evictExpiredSessions();
   // Also clean stale badGetTracker entries
+  const now = Date.now();
   for (const [ip, ts] of badGetTracker) {
     if (now - ts > BAD_GET_INTERVAL_MS * 5) badGetTracker.delete(ip);
   }
@@ -1574,9 +1610,35 @@ const httpServer = createServer(async (req, res) => {
       mcp_errors_total: metrics.mcp_errors_total,
       mcp_rate_limited_total: metrics.mcp_rate_limited_total,
       mcp_validation_failures_total: metrics.mcp_validation_failures_total,
+      mcp_evictions_total: metrics.evictions_total,
+      mcp_inflight_total: totalInflight(),
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(payload));
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/debug/sessions") {
+    const now = Date.now();
+    let oldestSessionAgeSec = 0;
+    for (const created of sessionTimestamps.values()) {
+      const age = Math.floor((now - created) / 1000);
+      if (age > oldestSessionAgeSec) oldestSessionAgeSec = age;
+    }
+
+    const byTokenHash = {};
+    for (const hash of tokenSessionIndex.keys()) {
+      byTokenHash[hash] = (byTokenHash[hash] || 0) + 1;
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      active_sessions: streamableTransports.size,
+      by_token_hash: byTokenHash,
+      oldest_session_age_sec: oldestSessionAgeSec,
+      evictions_total: metrics.evictions_total,
+      inflight_total: totalInflight(),
+    }));
     return;
   }
 
@@ -1682,10 +1744,11 @@ const httpServer = createServer(async (req, res) => {
 
   // ============ Authentication ============
   // Bearer-only authentication
+  const bearerToken = extractBearerToken(req);
+  const requestTokenHash = tokenHash(bearerToken);
   let authenticated = false;
   if (MCP_AUTH_TOKEN) {
-    const authHeader = req.headers["authorization"] || "";
-    if (authHeader.startsWith("Bearer ") && safeEqual(authHeader.slice(7), MCP_AUTH_TOKEN)) {
+    if (bearerToken && safeEqual(bearerToken, MCP_AUTH_TOKEN)) {
       authenticated = true;
     }
   } else {
@@ -1695,7 +1758,8 @@ const httpServer = createServer(async (req, res) => {
   // Protect MCP endpoints (both Streamable HTTP and legacy SSE)
   // Note: /vapi/chat/completions is NOT protected — it's behind nginx TLS and Vapi doesn't send auth headers
   const isProtectedPath = req.url === "/mcp" || req.url.startsWith("/mcp?") || req.url.startsWith("/mcp/")
-    || req.url === "/sse" || req.url.startsWith("/messages");
+    || req.url === "/sse" || req.url.startsWith("/messages")
+    || req.url === "/debug/sessions";
 
   if (isProtectedPath && !authenticated && req.method !== "OPTIONS") {
     metrics.mcp_errors_total += 1;
@@ -1717,8 +1781,19 @@ const httpServer = createServer(async (req, res) => {
   if (req.url === "/mcp") {
     // POST /mcp - handle JSON-RPC messages (initialize, tool calls, etc.)
     if (req.method === "POST") {
-      const sessionId = req.headers["mcp-session-id"];
+      let sessionId = req.headers["mcp-session-id"];
+      if (Array.isArray(sessionId)) sessionId = sessionId[0];
       let transport = sessionId ? streamableTransports.get(sessionId) : null;
+
+      // Reuse existing session for the same token when client omits session ID.
+      if (!transport && !sessionId && requestTokenHash) {
+        const mappedSessionId = tokenSessionIndex.get(requestTokenHash);
+        if (mappedSessionId && streamableTransports.has(mappedSessionId)) {
+          sessionId = mappedSessionId;
+          transport = streamableTransports.get(mappedSessionId);
+          setHeader(req, "Mcp-Session-Id", mappedSessionId);
+        }
+      }
 
       if (!transport) {
         if (sessionId) {
@@ -1733,6 +1808,9 @@ const httpServer = createServer(async (req, res) => {
             }
           }
         }
+
+        // Evict before trying to create a new session so stale sessions don't cause saturation.
+        evictExpiredSessions();
 
         // Session limit check
         if (streamableTransports.size >= MAX_SESSIONS) {
@@ -1771,6 +1849,7 @@ const httpServer = createServer(async (req, res) => {
             sessionTimestamps.delete(sid);
             sessionLastActivity.delete(sid);
             sessionInflightCounts.delete(sid);
+            removeSessionMappings(sid);
           }
           console.error(`Streamable HTTP session closed: ${sid} (active: ${streamableTransports.size})`);
         };
@@ -1781,6 +1860,9 @@ const httpServer = createServer(async (req, res) => {
           streamableTransports.set(transport.sessionId, transport);
           sessionTimestamps.set(transport.sessionId, Date.now());
           sessionLastActivity.set(transport.sessionId, Date.now());
+          if (requestTokenHash) {
+            tokenSessionIndex.set(requestTokenHash, transport.sessionId);
+          }
           console.error(`New session created: ${transport.sessionId} (active: ${streamableTransports.size})`);
         }
 
@@ -1837,6 +1919,9 @@ const httpServer = createServer(async (req, res) => {
 
           // Set the session ID on the actual request
           setHeader(req, "Mcp-Session-Id", transport.sessionId);
+          if (requestTokenHash && transport.sessionId) {
+            tokenSessionIndex.set(requestTokenHash, transport.sessionId);
+          }
           console.error(`Auto-initialized session ${transport.sessionId} for stale recovery`);
         }
       }
@@ -1844,6 +1929,10 @@ const httpServer = createServer(async (req, res) => {
       const existingSessionId = req.headers["mcp-session-id"];
       const resolvedSessionId = typeof existingSessionId === "string" ? existingSessionId : transport.sessionId;
       if (resolvedSessionId) {
+        sessionLastActivity.set(resolvedSessionId, Date.now());
+        if (requestTokenHash) {
+          tokenSessionIndex.set(requestTokenHash, resolvedSessionId);
+        }
         try {
           acquireInflightOrThrow(resolvedSessionId, MAX_CONCURRENCY_PER_SESSION);
           acquiredSessionId = resolvedSessionId;
@@ -1895,6 +1984,9 @@ const httpServer = createServer(async (req, res) => {
       if (transport.sessionId && !streamableTransports.has(transport.sessionId)) {
         streamableTransports.set(transport.sessionId, transport);
       }
+      if (transport.sessionId && requestTokenHash) {
+        tokenSessionIndex.set(requestTokenHash, transport.sessionId);
+      }
       return;
     }
 
@@ -1924,8 +2016,11 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === "DELETE") {
       // Acknowledge the DELETE but don't actually close the session
       // This prevents Claude's MCP client from tearing down sessions too early
-      const sessionId = req.headers["mcp-session-id"];
-      console.error(`DELETE requested for session ${sessionId} - keeping session alive`);
+      const deleteSessionId = req.headers["mcp-session-id"];
+      if (typeof deleteSessionId === "string") {
+        sessionLastActivity.set(deleteSessionId, Date.now());
+      }
+      console.error(`DELETE requested for session ${deleteSessionId} - keeping session alive`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok" }));
       return;
