@@ -3,18 +3,29 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
+  ErrorCode,
   ListToolsRequestSchema,
+  McpError,
+  SUPPORTED_PROTOCOL_VERSIONS,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createServer } from "node:http";
 import crypto from "node:crypto";
 import axios from "axios";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import dotenv from "dotenv";
 dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 const PORT = process.env.PORT || 3001;
 const N8N_BASE_URL = process.env.N8N_BASE_URL || "http://localhost:5678";
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
 const USER_EMAIL = process.env.USER_EMAIL || "your-email@example.com";
 const SMTP_CREDENTIAL_ID = process.env.SMTP_CREDENTIAL_ID || "";
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || "";
 const n8nClient = axios.create({
   baseURL: N8N_BASE_URL,
   headers: {
@@ -22,6 +33,235 @@ const n8nClient = axios.create({
     "Content-Type": "application/json",
   },
 });
+
+const ajv = new Ajv({ allErrors: true, removeAdditional: false, strict: false });
+addFormats(ajv);
+const validatorCache = new Map();
+const metrics = {
+  mcp_tool_calls_total: 0,
+  mcp_errors_total: 0,
+  mcp_rate_limited_total: 0,
+  mcp_validation_failures_total: 0,
+};
+
+const TOOL_INPUT_SCHEMAS = {
+  list_workflows: { type: "object", properties: {}, required: [] },
+  get_workflow_details: {
+    type: "object",
+    properties: { workflow_id: { type: "string" } },
+    required: ["workflow_id"],
+  },
+  create_workflow: {
+    type: "object",
+    properties: { name: { type: "string" }, description: { type: "string" } },
+    required: ["name"],
+  },
+  delete_workflow: {
+    type: "object",
+    properties: { workflow_id: { type: "string" } },
+    required: ["workflow_id"],
+  },
+  activate_workflow: {
+    type: "object",
+    properties: { workflow_id: { type: "string" }, active: { type: "boolean" } },
+    required: ["workflow_id", "active"],
+  },
+  add_node_to_workflow: {
+    type: "object",
+    properties: {
+      workflow_id: { type: "string" },
+      node_name: { type: "string" },
+      node_type: { type: "string" },
+      position: { type: "array", items: { type: "number" } },
+      config: { type: "object" },
+      credentials: { type: "object" },
+    },
+    required: ["workflow_id", "node_name", "node_type", "position"],
+  },
+  remove_node_from_workflow: {
+    type: "object",
+    properties: { workflow_id: { type: "string" }, node_name: { type: "string" } },
+    required: ["workflow_id", "node_name"],
+  },
+  update_node: {
+    type: "object",
+    properties: {
+      workflow_id: { type: "string" },
+      node_name: { type: "string" },
+      config: { type: "object" },
+      credentials: { type: "object" },
+    },
+    required: ["workflow_id", "node_name"],
+  },
+  connect_nodes: {
+    type: "object",
+    properties: {
+      workflow_id: { type: "string" },
+      from_node: { type: "string" },
+      to_node: { type: "string" },
+      from_output: { type: "string" },
+    },
+    required: ["workflow_id", "from_node", "to_node"],
+  },
+  execute_workflow: {
+    type: "object",
+    properties: { workflow_id: { type: "string" } },
+    required: ["workflow_id"],
+  },
+  get_execution_result: {
+    type: "object",
+    properties: { execution_id: { type: "string" } },
+    required: ["execution_id"],
+  },
+  get_workflow_executions: {
+    type: "object",
+    properties: { workflow_id: { type: "string" }, limit: { type: "number" } },
+    required: ["workflow_id"],
+  },
+  create_webhook: {
+    type: "object",
+    properties: { workflow_id: { type: "string" }, path: { type: "string" } },
+    required: ["workflow_id", "path"],
+  },
+  list_webhooks: {
+    type: "object",
+    properties: { workflow_id: { type: "string" } },
+    required: ["workflow_id"],
+  },
+  get_webhook_logs: {
+    type: "object",
+    properties: { workflow_id: { type: "string" }, limit: { type: "number" } },
+    required: ["workflow_id"],
+  },
+  list_credentials: { type: "object", properties: {}, required: [] },
+  create_credential: {
+    type: "object",
+    properties: { name: { type: "string" }, type: { type: "string" }, data: { type: "object" } },
+    required: ["name", "type", "data"],
+  },
+  list_variables: { type: "object", properties: {}, required: [] },
+  set_variable: {
+    type: "object",
+    properties: { key: { type: "string" }, value: {} },
+    required: ["key", "value"],
+  },
+  get_variable: {
+    type: "object",
+    properties: { key: { type: "string" } },
+    required: ["key"],
+  },
+  list_schedules: { type: "object", properties: {}, required: [] },
+  set_schedule: {
+    type: "object",
+    properties: { workflow_id: { type: "string" }, cron: { type: "string" } },
+    required: ["workflow_id", "cron"],
+  },
+  send_result_email: {
+    type: "object",
+    properties: { subject: { type: "string" }, body: { type: "string" }, to_email: { type: "string" } },
+    required: ["subject", "body"],
+  },
+  update_workflow: {
+    type: "object",
+    properties: { workflow_id: { type: "string" }, workflow_json: { type: "string" } },
+    required: ["workflow_id", "workflow_json"],
+  },
+  disconnect_nodes: {
+    type: "object",
+    properties: { workflow_id: { type: "string" }, from_node: { type: "string" }, to_node: { type: "string" } },
+    required: ["workflow_id", "from_node", "to_node"],
+  },
+};
+
+function validateToolArgsOrThrow(toolName, inputSchema, args) {
+  const schema = {
+    ...inputSchema,
+    type: "object",
+    additionalProperties: false,
+  };
+
+  let validate = validatorCache.get(toolName);
+  if (!validate) {
+    validate = ajv.compile(schema);
+    validatorCache.set(toolName, validate);
+  }
+
+  const candidateArgs = args === undefined ? {} : args;
+  const ok = validate(candidateArgs);
+  if (ok) {
+    return;
+  }
+
+  const invalid_fields = (validate.errors || []).map((e) => ({
+    field: (e.instancePath || "").replace(/^\//, "") || "(root)",
+    reason: e.message || "invalid",
+    expected: e.params || {},
+  }));
+  metrics.mcp_validation_failures_total += 1;
+
+  throw new McpError(ErrorCode.InvalidParams, "Invalid params", {
+    error_code: "INVALID_PARAMS",
+    retryable: false,
+    details: { invalid_fields, tool_name: toolName },
+  });
+}
+
+function mapToolError(error, { correlationId, sessionId, toolName, durationMs }) {
+  if (error instanceof McpError) {
+    metrics.mcp_errors_total += 1;
+    if (error.code === -32003 || error.code === -32000 || error.code === -32029) {
+      metrics.mcp_rate_limited_total += 1;
+    }
+    return error;
+  }
+
+  const status = error?.response?.status;
+  const downstreamMessage = error?.response?.data?.message || error?.message || "Internal server error";
+  let code = ErrorCode.InternalError;
+  let message = "Internal server error";
+  let errorCode = "INTERNAL_ERROR";
+  let retryable = false;
+  let details = {};
+
+  if (status === 404) {
+    code = -32010;
+    message = "Resource not found";
+    errorCode = "RESOURCE_NOT_FOUND";
+  } else if (status === 401 || status === 403) {
+    code = -32011;
+    message = "Downstream auth failed";
+    errorCode = "DOWNSTREAM_AUTH_FAILED";
+  } else if (status === 429) {
+    code = -32029;
+    message = "Downstream rate limit";
+    errorCode = "DOWNSTREAM_RATE_LIMIT";
+    retryable = true;
+    metrics.mcp_rate_limited_total += 1;
+    const retryAfterHeader = error?.response?.headers?.["retry-after"];
+    const retryAfterSeconds = Number.parseInt(retryAfterHeader || "1", 10);
+    details.retry_after_ms = Number.isFinite(retryAfterSeconds) ? retryAfterSeconds * 1000 : 1000;
+  } else if (status >= 500) {
+    code = -32050;
+    message = "Downstream service unavailable";
+    errorCode = "DOWNSTREAM_5XX";
+    retryable = true;
+  }
+  metrics.mcp_errors_total += 1;
+
+  return new McpError(code, message, {
+    error_code: errorCode,
+    retryable,
+    details: {
+      ...details,
+      upstream_status: status ?? null,
+      upstream_message: downstreamMessage,
+      correlation_id: correlationId,
+      session_id: sessionId || null,
+      tool_name: toolName || null,
+      duration_ms: durationMs ?? 0,
+    },
+  });
+}
 function registerHandlers(server) {
 // List all available tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -348,7 +588,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const startedAt = Date.now();
+  const correlationId = crypto.randomUUID();
+  const { name, arguments: args } = request.params || {};
+  metrics.mcp_tool_calls_total += 1;
+  console.error(`[mcp][${correlationId}] tools/call name=${name || "unknown"}`);
+  const withCorrelation = (result) => ({
+    ...result,
+    _meta: {
+      ...(result?._meta || {}),
+      correlation_id: correlationId,
+    },
+  });
+  const toolSchema = TOOL_INPUT_SCHEMAS[name];
+  if (!toolSchema) {
+    throw new McpError(-32010, "Tool not found", {
+      error_code: "RESOURCE_NOT_FOUND",
+      retryable: false,
+      details: {
+        tool_name: name || null,
+        correlation_id: correlationId,
+      },
+    });
+  }
+
+  validateToolArgsOrThrow(name, toolSchema, args);
+
   try {
     // ============ WORKFLOW QUERIES ============
     if (name === "list_workflows") {
@@ -361,20 +626,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         nodes: w.nodes?.length || 0,
         createdAt: w.createdAt,
       }));
-      return {
+      return withCorrelation({
         content: [
           {
             type: "text",
             text: `Found ${filtered.length} workflows:\n\n${JSON.stringify(filtered, null, 2)}`,
           },
         ],
-      };
+      });
     }
     if (name === "get_workflow_details") {
       const { workflow_id } = args;
       const response = await n8nClient.get(`/api/v1/workflows/${workflow_id}`);
       const workflow = response.data;
-      return {
+      return withCorrelation({
         content: [
           {
             type: "text",
@@ -399,7 +664,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             )}`,
           },
         ],
-      };
+      });
     }
     // ============ NODE MANAGEMENT ============
     // Helper: save workflow via PUT with required fields only
@@ -563,73 +828,77 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // Attempt 4: Create a temporary webhook-triggered wrapper workflow that
       // uses the Execute Workflow node to run the target workflow
-      try {
-        const wrapperPath = `_exec_${workflow_id}_${Date.now()}`;
-        const wrapperNodes = [
-          {
-            id: crypto.randomUUID(),
-            name: "Webhook",
-            type: "n8n-nodes-base.webhook",
-            position: [0, 0],
-            parameters: { path: wrapperPath, httpMethod: "GET", responseMode: "lastNode" },
-            typeVersion: 2,
-            webhookId: crypto.randomUUID(),
-          },
-          {
-            id: crypto.randomUUID(),
-            name: "Execute Target",
-            type: "n8n-nodes-base.executeWorkflow",
-            position: [300, 0],
-            parameters: { workflowId: { value: workflow_id }, mode: "once" },
-            typeVersion: 1,
-          },
-        ];
-        const wrapperWf = await n8nClient.post("/api/v1/workflows", {
-          name: `_auto_exec_${Date.now()}`,
-          nodes: wrapperNodes,
-          connections: {
-            Webhook: { main: [[{ node: "Execute Target", type: "main", index: 0 }]] },
-          },
-          settings: {},
-        });
-        const wrapperId = wrapperWf.data.id;
-
-        // Activate it so webhook registers
+      {
+        let tempWorkflowId = null;
         try {
-          await n8nClient.post(`/api/v1/workflows/${wrapperId}/activate`);
-        } catch {
-          // Try PUT fallback
-          const wf = (await n8nClient.get(`/api/v1/workflows/${wrapperId}`)).data;
-          wf.active = true;
-          await n8nClient.put(`/api/v1/workflows/${wrapperId}`, {
-            name: wf.name, nodes: wf.nodes, connections: wf.connections,
-            settings: wf.settings || {}, active: true,
-          });
-        }
-
-        // Small delay for webhook registration
-        await new Promise(r => setTimeout(r, 1000));
-
-        // Trigger via webhook
-        const webhookUrl = `${N8N_BASE_URL}/webhook/${wrapperPath}`;
-        const execResponse = await axios.get(webhookUrl);
-
-        // Cleanup wrapper
-        try {
-          await n8nClient.post(`/api/v1/workflows/${wrapperId}/deactivate`).catch(() => {});
-          await n8nClient.delete(`/api/v1/workflows/${wrapperId}`);
-        } catch {}
-
-        return {
-          content: [
+          const wrapperPath = `_exec_${workflow_id}_${Date.now()}`;
+          const wrapperNodes = [
             {
-              type: "text",
-              text: `Workflow executed via wrapper!\n\nTarget: ${workflow_id}\nResponse: ${JSON.stringify(execResponse.data, null, 2)}\n(wrapper workflow cleaned up)`,
+              id: crypto.randomUUID(),
+              name: "Webhook",
+              type: "n8n-nodes-base.webhook",
+              position: [0, 0],
+              parameters: { path: wrapperPath, httpMethod: "GET", responseMode: "lastNode" },
+              typeVersion: 2,
+              webhookId: crypto.randomUUID(),
             },
-          ],
-        };
-      } catch (e4) {
-        errors.push(`Wrapper execution: ${e4.response?.status || ""} ${e4.response?.data?.message || e4.message}`);
+            {
+              id: crypto.randomUUID(),
+              name: "Execute Target",
+              type: "n8n-nodes-base.executeWorkflow",
+              position: [300, 0],
+              parameters: { workflowId: { value: workflow_id }, mode: "once" },
+              typeVersion: 1,
+            },
+          ];
+          const wrapperWf = await n8nClient.post("/api/v1/workflows", {
+            name: `_auto_exec_${Date.now()}`,
+            nodes: wrapperNodes,
+            connections: {
+              Webhook: { main: [[{ node: "Execute Target", type: "main", index: 0 }]] },
+            },
+            settings: {},
+          });
+          tempWorkflowId = wrapperWf.data.id;
+
+          // Activate it so webhook registers
+          try {
+            await n8nClient.post(`/api/v1/workflows/${tempWorkflowId}/activate`);
+          } catch {
+            // Try PUT fallback
+            const wf = (await n8nClient.get(`/api/v1/workflows/${tempWorkflowId}`)).data;
+            wf.active = true;
+            await n8nClient.put(`/api/v1/workflows/${tempWorkflowId}`, {
+              name: wf.name, nodes: wf.nodes, connections: wf.connections,
+              settings: wf.settings || {}, active: true,
+            });
+          }
+
+          // Small delay for webhook registration
+          await new Promise(r => setTimeout(r, 1000));
+
+          // Trigger via webhook
+          const webhookUrl = `${N8N_BASE_URL}/webhook/${wrapperPath}`;
+          const execResponse = await axios.get(webhookUrl);
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Workflow executed via wrapper!\n\nTarget: ${workflow_id}\nResponse: ${JSON.stringify(execResponse.data, null, 2)}\n(wrapper workflow cleaned up)`,
+              },
+            ],
+          };
+        } catch (e4) {
+          errors.push(`Wrapper execution: ${e4.response?.status || ""} ${e4.response?.data?.message || e4.message}`);
+        } finally {
+          if (tempWorkflowId) {
+            await n8nClient.post(`/api/v1/workflows/${tempWorkflowId}/deactivate`)
+              .catch(() => {});
+            await n8nClient.delete(`/api/v1/workflows/${tempWorkflowId}`)
+              .catch(err => console.error(`Cleanup failed for wrapper ${tempWorkflowId}:`, err.message));
+          }
+        }
       }
 
       throw new Error(
@@ -1097,20 +1366,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     }
-    return {
-      content: [{ type: "text", text: `Unknown tool: ${name}` }],
-      isError: true,
-    };
+    throw new McpError(-32010, "Tool not found", {
+      error_code: "RESOURCE_NOT_FOUND",
+      retryable: false,
+      details: { tool_name: name, correlation_id: correlationId },
+    });
   } catch (error) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Error: ${error.response?.data?.message || error.message}`,
-        },
-      ],
-      isError: true,
-    };
+    throw mapToolError(error, {
+      correlationId,
+      toolName: name,
+      durationMs: Date.now() - startedAt,
+    });
   }
 });
 } // end registerHandlers
@@ -1121,14 +1387,171 @@ const transports = new Map();
 // Track Streamable HTTP transports by session ID
 const streamableTransports = new Map();
 
-const httpServer = createServer(async (req, res) => {
-  // Log all requests for debugging
-  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} Headers: ${JSON.stringify(req.headers)}`);
+// Rate-limit tracker for bad GET requests (prevent log flooding)
+const badGetTracker = new Map();
+const BAD_GET_INTERVAL_MS = 60000; // Only log once per minute per IP
 
-  // CORS headers for Claude.ai
-  res.setHeader("Access-Control-Allow-Origin", "*");
+// Session limits
+const MAX_SESSIONS = Number.parseInt(process.env.MAX_ACTIVE_SESSIONS || "100", 10);
+const SESSION_TTL_MS = Number.parseInt(process.env.SESSION_TTL_SECONDS || "1800", 10) * 1000;
+const SESSION_IDLE_TTL_MS = Number.parseInt(process.env.SESSION_IDLE_TTL_SECONDS || "600", 10) * 1000;
+const MAX_CONCURRENCY_PER_SESSION = Number.parseInt(process.env.MAX_CONCURRENCY_PER_SESSION || "4", 10);
+const CONCURRENCY_HOLD_MS = Number.parseInt(process.env.CONCURRENCY_HOLD_MS || "8", 10);
+const sessionTimestamps = new Map(); // sessionId → creation time
+const sessionLastActivity = new Map(); // sessionId → last activity
+const sessionInflightCounts = new Map(); // sessionId → in-flight request count
+
+function writeJsonRpcError(res, {
+  code,
+  message,
+  error_code,
+  retryable = false,
+  details = {},
+  correlation_id = null,
+  id = null,
+}, statusCode = 400) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code,
+      message,
+      data: {
+        error_code,
+        retryable,
+        correlation_id,
+        details,
+      },
+    },
+  }));
+}
+
+function acquireInflightOrThrow(sessionId, maxConcurrency) {
+  const current = sessionInflightCounts.get(sessionId) || 0;
+  if (current >= maxConcurrency) {
+    throw new McpError(-32003, "Session concurrency limit exceeded", {
+      error_code: "SESSION_CONCURRENCY_LIMIT",
+      retryable: true,
+      details: {
+        max_concurrency_per_session: maxConcurrency,
+        retry_after_ms: 250,
+      },
+    });
+  }
+  const next = current + 1;
+  sessionInflightCounts.set(sessionId, next);
+  return next;
+}
+
+function releaseInflight(sessionId) {
+  const current = sessionInflightCounts.get(sessionId) || 0;
+  if (current <= 1) {
+    sessionInflightCounts.delete(sessionId);
+    return;
+  }
+  sessionInflightCounts.set(sessionId, current - 1);
+}
+
+// Evict expired sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, created] of sessionTimestamps) {
+    const lastActivity = sessionLastActivity.get(sid) || created;
+    const ttlExpired = now - created > SESSION_TTL_MS;
+    const idleExpired = now - lastActivity > SESSION_IDLE_TTL_MS;
+    if (ttlExpired || idleExpired) {
+      const transport = streamableTransports.get(sid);
+      if (transport) {
+        try { transport.close?.(); } catch {}
+      }
+      streamableTransports.delete(sid);
+      sessionTimestamps.delete(sid);
+      sessionLastActivity.delete(sid);
+      sessionInflightCounts.delete(sid);
+    }
+  }
+  // Also clean stale badGetTracker entries
+  for (const [ip, ts] of badGetTracker) {
+    if (now - ts > BAD_GET_INTERVAL_MS * 5) badGetTracker.delete(ip);
+  }
+}, 60000);
+
+/**
+ * Constant-time string comparison to prevent timing attacks on auth tokens.
+ */
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+/**
+ * Set a header on both req.headers and req.rawHeaders (Hono reads rawHeaders).
+ */
+function setHeader(req, name, value) {
+  const lowerName = name.toLowerCase();
+  req.headers[lowerName] = value;
+  // rawHeaders is a flat [key, value, key, value, ...] array
+  let found = false;
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    if (req.rawHeaders[i].toLowerCase() === lowerName) {
+      req.rawHeaders[i + 1] = value;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    req.rawHeaders.push(name, value);
+  }
+}
+
+/**
+ * Normalize incoming request headers for SDK compatibility.
+ * - Maps unsupported mcp-protocol-version values to closest supported version
+ * - Ensures Accept header includes required content types
+ */
+function normalizeHeaders(req) {
+  // Fix protocol version: map unknown versions to closest supported
+  const protoVer = req.headers["mcp-protocol-version"];
+  if (protoVer && !SUPPORTED_PROTOCOL_VERSIONS.includes(protoVer)) {
+    const sorted = [...SUPPORTED_PROTOCOL_VERSIONS].filter(v => !v.startsWith("DRAFT")).sort();
+    const closest = sorted.reverse().find(v => v <= protoVer) || sorted[0] || SUPPORTED_PROTOCOL_VERSIONS[0];
+    console.error(`Mapping unsupported protocol ${protoVer} → ${closest}`);
+    setHeader(req, "mcp-protocol-version", closest);
+  }
+
+  // Fix Accept header: SDK requires both application/json and text/event-stream for POST
+  if (req.method === "POST") {
+    const accept = req.headers["accept"] || "";
+    if (!accept.includes("application/json") || !accept.includes("text/event-stream")) {
+      setHeader(req, "Accept", "application/json, text/event-stream");
+    }
+  }
+  // Fix Accept header for GET: SDK requires text/event-stream
+  if (req.method === "GET") {
+    const accept = req.headers["accept"] || "";
+    if (!accept.includes("text/event-stream")) {
+      setHeader(req, "Accept", "text/event-stream");
+    }
+  }
+}
+
+const httpServer = createServer(async (req, res) => {
+  const correlationId = crypto.randomUUID();
+  res.setHeader("X-Correlation-Id", correlationId);
+  // Log requests with token redacted
+  const safeUrl = MCP_AUTH_TOKEN ? req.url.replace(MCP_AUTH_TOKEN, "***") : req.url;
+  console.error(`[${new Date().toISOString()}] [${correlationId}] ${req.method} ${safeUrl}`);
+
+  // CORS - restrict to known origins (Claude.ai, OpenAI, localhost)
+  const origin = req.headers["origin"] || "";
+  const allowedOrigins = ["https://claude.ai", "https://chat.openai.com", "https://platform.openai.com", "https://chatgpt.com"];
+  if (allowedOrigins.includes(origin) || origin.startsWith("http://localhost")) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Authorization, mcp-protocol-version");
   res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
   if (req.method === "OPTIONS") {
@@ -1140,9 +1563,155 @@ const httpServer = createServer(async (req, res) => {
   // Health check
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", server: "n8n-mcp-server", version: "2.1.0" }));
+    res.end(JSON.stringify({ status: "ok" }));
     return;
   }
+
+  if (req.method === "GET" && req.url === "/metrics") {
+    const payload = {
+      mcp_active_sessions: streamableTransports.size,
+      mcp_tool_calls_total: metrics.mcp_tool_calls_total,
+      mcp_errors_total: metrics.mcp_errors_total,
+      mcp_rate_limited_total: metrics.mcp_rate_limited_total,
+      mcp_validation_failures_total: metrics.mcp_validation_failures_total,
+    };
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(payload));
+    return;
+  }
+
+  // ============ Outbound Demo UI ============
+  if (req.method === "GET" && (req.url === "/demo" || req.url === "/demo/")) {
+    try {
+      const html = await readFile(join(__dirname, "public", "demo.html"), "utf8");
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(html);
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("Demo page not found");
+    }
+    return;
+  }
+
+  // POST /demo-api/outbound-call — create a Vapi outbound call
+  if (req.method === "POST" && req.url === "/demo-api/outbound-call") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    try {
+      const { phone, use_case, forced_intent, active_profile, goal, success_criteria } = JSON.parse(body);
+      if (!phone) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Phone number required" }));
+        return;
+      }
+      const VAPI_KEY = process.env.VAPI_API_KEY || "205b02f6-0738-45d5-99e4-427b6c022312";
+      const OUTBOUND_ASSISTANT_ID = "20177a65-d618-4875-b029-dfb7fa6d1da3";
+      const ucGoal = goal || "Handle outbound customer interaction.";
+      const ucSuccess = success_criteria || "Customer engagement completed";
+
+      const OUTBOUND_PHONE_NUMBER_ID = "fa7c2978-38fc-4456-9d92-747c119ef16d";
+
+      const vapiPayload = {
+        assistantId: OUTBOUND_ASSISTANT_ID,
+        phoneNumberId: OUTBOUND_PHONE_NUMBER_ID,
+        customer: { number: phone },
+        metadata: {
+          outbound: true,
+          use_case: use_case || "RETENTION_CONTRACT_EXPIRY",
+          forced_intent: forced_intent || "RETENTION",
+          active_profile: active_profile || "HIGH_END",
+          goal: ucGoal,
+          success_criteria: ucSuccess,
+        },
+      };
+
+      console.error(`[DEMO] Creating outbound call: phone=${phone}, use_case=${use_case}, profile=${active_profile}`);
+      const vapiRes = await axios.post("https://api.vapi.ai/call", vapiPayload, {
+        headers: { Authorization: `Bearer ${VAPI_KEY}`, "Content-Type": "application/json" },
+        timeout: 15000,
+      });
+
+      const callData = vapiRes.data;
+      const callId = callData.id;
+
+      // Pre-cache metadata so outbound proxy picks it up
+      if (!global._outboundMetadataCache) global._outboundMetadataCache = {};
+      global._outboundMetadataCache[callId] = { ...vapiPayload.metadata };
+
+      console.error(`[DEMO] Call created: id=${callId}, status=${callData.status}`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ callId, status: callData.status || "queued" }));
+    } catch (e) {
+      console.error(`[DEMO] Call creation failed: ${e.response?.data ? JSON.stringify(e.response.data) : e.message}`);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.response?.data?.message || e.message }));
+    }
+    return;
+  }
+
+  // GET /demo-api/call-status/:callId — poll Vapi for call status
+  if (req.method === "GET" && req.url?.startsWith("/demo-api/call-status/")) {
+    const callId = req.url.split("/demo-api/call-status/")[1];
+    if (!callId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Call ID required" }));
+      return;
+    }
+    try {
+      const VAPI_KEY = process.env.VAPI_API_KEY || "205b02f6-0738-45d5-99e4-427b6c022312";
+      const vapiRes = await axios.get(`https://api.vapi.ai/call/${callId}`, {
+        headers: { Authorization: `Bearer ${VAPI_KEY}` },
+        timeout: 10000,
+      });
+      const call = vapiRes.data;
+      const result = {
+        status: call.status || "unknown",
+        duration: call.duration || null,
+        endedReason: call.endedReason || null,
+        transcript: call.transcript || null,
+        messages: call.messages || null,
+      };
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message, status: "unknown" }));
+    }
+    return;
+  }
+
+  // ============ Authentication ============
+  // Bearer-only authentication
+  let authenticated = false;
+  if (MCP_AUTH_TOKEN) {
+    const authHeader = req.headers["authorization"] || "";
+    if (authHeader.startsWith("Bearer ") && safeEqual(authHeader.slice(7), MCP_AUTH_TOKEN)) {
+      authenticated = true;
+    }
+  } else {
+    authenticated = true; // No token configured = open access
+  }
+
+  // Protect MCP endpoints (both Streamable HTTP and legacy SSE)
+  // Note: /vapi/chat/completions is NOT protected — it's behind nginx TLS and Vapi doesn't send auth headers
+  const isProtectedPath = req.url === "/mcp" || req.url.startsWith("/mcp?") || req.url.startsWith("/mcp/")
+    || req.url === "/sse" || req.url.startsWith("/messages");
+
+  if (isProtectedPath && !authenticated && req.method !== "OPTIONS") {
+    metrics.mcp_errors_total += 1;
+    writeJsonRpcError(res, {
+      code: -32001,
+      message: "Authentication failed",
+      error_code: "AUTH_FAILED",
+      retryable: false,
+      correlation_id: correlationId,
+      details: {},
+    }, 401);
+    return;
+  }
+
+  // Normalize headers for SDK compatibility (protocol version, Accept)
+  normalizeHeaders(req);
 
   // ============ Streamable HTTP transport at /mcp ============
   if (req.url === "/mcp") {
@@ -1152,67 +1721,172 @@ const httpServer = createServer(async (req, res) => {
       let transport = sessionId ? streamableTransports.get(sessionId) : null;
 
       if (!transport) {
-        // Check if this is a request with a stale session ID (not an initialize)
-        // Read the body to check the method
-        const chunks = [];
-        for await (const chunk of req) chunks.push(chunk);
-        const bodyStr = Buffer.concat(chunks).toString();
-        let body;
-        try { body = JSON.parse(bodyStr); } catch { body = {}; }
+        if (sessionId) {
+          // Stale session — strip the old session ID and create fresh
+          // Claude's MCP client doesn't re-initialize on 404, so we recover gracefully
+          console.error(`Stale session ${sessionId} — auto-recovering`);
+          delete req.headers["mcp-session-id"];
+          for (let i = 0; i < req.rawHeaders.length; i += 2) {
+            if (req.rawHeaders[i].toLowerCase() === "mcp-session-id") {
+              req.rawHeaders.splice(i, 2);
+              break;
+            }
+          }
+        }
 
-        if (sessionId && body.method !== "initialize") {
-          // Stale session - tell client to re-initialize
-          // Return 404 which signals Claude to create a new session
-          console.error(`Stale session ${sessionId}, method: ${body.method} - returning 404`);
-          res.writeHead(404, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ 
-            jsonrpc: "2.0", 
-            error: { code: -32600, message: "Session expired. Please re-initialize." },
-            id: body.id || null
-          }));
+        // Session limit check
+        if (streamableTransports.size >= MAX_SESSIONS) {
+          console.error(`Session limit reached (${MAX_SESSIONS}), rejecting new session`);
+          metrics.mcp_errors_total += 1;
+          metrics.mcp_rate_limited_total += 1;
+          writeJsonRpcError(res, {
+            code: -32000,
+            message: "Server busy. Too many active sessions.",
+            error_code: "SESSION_CAPACITY_EXCEEDED",
+            retryable: true,
+            correlation_id: correlationId,
+            details: {
+              max_active_sessions: MAX_SESSIONS,
+              retry_after_ms: 1000,
+            },
+          }, 503);
           return;
         }
 
-        // New session (initialize request) - create transport and server
+        // New session - create transport and server
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => crypto.randomUUID(),
-          enableJsonResponse: true,
         });
 
         const serverInstance = new Server(
-          { name: "n8n-mcp-server", version: "2.3.3" },
+          { name: "n8n-mcp-server", version: "2.5.0" },
           { capabilities: { tools: {} } }
         );
         registerHandlers(serverInstance);
 
         transport.onclose = () => {
           const sid = transport.sessionId;
-          if (sid) streamableTransports.delete(sid);
-          console.error(`Streamable HTTP session closed: ${sid}`);
+          if (sid) {
+            streamableTransports.delete(sid);
+            sessionTimestamps.delete(sid);
+            sessionLastActivity.delete(sid);
+            sessionInflightCounts.delete(sid);
+          }
+          console.error(`Streamable HTTP session closed: ${sid} (active: ${streamableTransports.size})`);
         };
 
         await serverInstance.connect(transport);
 
-        // Store by session ID after connection
         if (transport.sessionId) {
           streamableTransports.set(transport.sessionId, transport);
-          console.error(`New session created: ${transport.sessionId}`);
+          sessionTimestamps.set(transport.sessionId, Date.now());
+          sessionLastActivity.set(transport.sessionId, Date.now());
+          console.error(`New session created: ${transport.sessionId} (active: ${streamableTransports.size})`);
         }
 
-        // Re-create the request with the buffered body for the transport to handle
-        const { Readable } = await import("node:stream");
-        const newReq = Object.assign(Readable.from(Buffer.from(bodyStr)), {
-          method: req.method,
-          url: req.url,
-          headers: req.headers,
-          httpVersion: req.httpVersion,
-        });
-        await transport.handleRequest(newReq, res);
+        // If this was a stale session recovery, the incoming request is likely a tool call,
+        // not an initialize. We need to auto-initialize first, then process the actual request.
+        if (sessionId) {
+          // Synthesize an initialize request to bootstrap the session
+          const { Readable } = await import("node:stream");
+          const initPayload = JSON.stringify({
+            jsonrpc: "2.0",
+            id: "_auto_init_" + Date.now(),
+            method: "initialize",
+            params: {
+              protocolVersion: req.headers["mcp-protocol-version"] || "2025-11-25",
+              capabilities: {},
+              clientInfo: { name: "auto-recovery", version: "1.0" },
+            },
+          });
+          const initReq = new Readable({ read() { this.push(initPayload); this.push(null); } });
+          Object.assign(initReq, {
+            method: "POST",
+            url: "/mcp",
+            headers: { ...req.headers, "content-type": "application/json", "content-length": String(initPayload.length) },
+            rawHeaders: ["Content-Type", "application/json", "Accept", "application/json, text/event-stream", "Content-Length", String(initPayload.length)],
+            socket: req.socket,
+          });
+          // Process init silently (discard response)
+          const { Writable } = await import("node:stream");
+          const devNull = new Writable({
+            write(chunk, enc, cb) { cb(); },
+          });
+          devNull.writeHead = () => devNull;
+          devNull.setHeader = () => devNull;
+          devNull.flushHeaders = () => {};
+          devNull.headersSent = false;
+          await transport.handleRequest(initReq, devNull);
 
-        if (transport.sessionId && !streamableTransports.has(transport.sessionId)) {
-          streamableTransports.set(transport.sessionId, transport);
+          // Send initialized notification
+          const notifPayload = JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" });
+          const notifReq = new Readable({ read() { this.push(notifPayload); this.push(null); } });
+          Object.assign(notifReq, {
+            method: "POST",
+            url: "/mcp",
+            headers: { ...req.headers, "mcp-session-id": transport.sessionId, "content-type": "application/json", "content-length": String(notifPayload.length) },
+            rawHeaders: ["Content-Type", "application/json", "Accept", "application/json, text/event-stream", "Mcp-Session-Id", transport.sessionId, "Content-Length", String(notifPayload.length)],
+            socket: req.socket,
+          });
+          const devNull2 = new Writable({ write(chunk, enc, cb) { cb(); } });
+          devNull2.writeHead = () => devNull2;
+          devNull2.setHeader = () => devNull2;
+          devNull2.flushHeaders = () => {};
+          devNull2.headersSent = false;
+          await transport.handleRequest(notifReq, devNull2);
+
+          // Set the session ID on the actual request
+          setHeader(req, "Mcp-Session-Id", transport.sessionId);
+          console.error(`Auto-initialized session ${transport.sessionId} for stale recovery`);
         }
-        return;
+      }
+      let acquiredSessionId = null;
+      const existingSessionId = req.headers["mcp-session-id"];
+      const resolvedSessionId = typeof existingSessionId === "string" ? existingSessionId : transport.sessionId;
+      if (resolvedSessionId) {
+        try {
+          acquireInflightOrThrow(resolvedSessionId, MAX_CONCURRENCY_PER_SESSION);
+          acquiredSessionId = resolvedSessionId;
+        } catch (err) {
+          const error = mapToolError(err, {
+            correlationId: crypto.randomUUID(),
+            sessionId: resolvedSessionId,
+            toolName: null,
+            durationMs: 0,
+          });
+          writeJsonRpcError(res, {
+            code: error.code || -32003,
+            message: error.message || "Session concurrency limit exceeded",
+            error_code: error?.data?.error_code || "SESSION_CONCURRENCY_LIMIT",
+            retryable: error?.data?.retryable ?? true,
+            correlation_id: correlationId,
+            details: error?.data?.details || {
+              max_concurrency_per_session: MAX_CONCURRENCY_PER_SESSION,
+              retry_after_ms: 250,
+            },
+          }, 429);
+          return;
+        }
+      }
+
+      if (acquiredSessionId) {
+        let released = false;
+        const releaseOnce = () => {
+          if (released) return;
+          released = true;
+          const holdMs = CONCURRENCY_HOLD_MS;
+          const releaseAction = () => {
+            releaseInflight(acquiredSessionId);
+            sessionLastActivity.set(acquiredSessionId, Date.now());
+          };
+          if (holdMs > 0) {
+            setTimeout(releaseAction, holdMs);
+          } else {
+            releaseAction();
+          }
+        };
+        res.once("finish", releaseOnce);
+        res.once("close", releaseOnce);
       }
 
       await transport.handleRequest(req, res);
@@ -1230,10 +1904,18 @@ const httpServer = createServer(async (req, res) => {
       const transport = sessionId ? streamableTransports.get(sessionId) : null;
       if (transport) {
         await transport.handleRequest(req, res);
+        sessionLastActivity.set(sessionId, Date.now());
       } else {
-        console.error(`GET with unknown session: ${sessionId} - returning 400`);
+        // Rate-limit log flooding from clients repeatedly hitting with bad/no session
+        const clientIp = req.headers["x-real-ip"] || req.socket.remoteAddress || "unknown";
+        const now = Date.now();
+        const lastLog = badGetTracker.get(clientIp) || 0;
+        if (now - lastLog > BAD_GET_INTERVAL_MS) {
+          console.error(`GET /mcp with unknown session from ${clientIp} (sid: ${sessionId || "none"})`);
+          badGetTracker.set(clientIp, now);
+        }
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Session expired. Please re-initialize." }));
+        res.end(JSON.stringify({ error: "Session expired. Please re-initialize with POST." }));
       }
       return;
     }
@@ -1263,7 +1945,7 @@ const httpServer = createServer(async (req, res) => {
     };
 
     const serverInstance = new Server(
-      { name: "n8n-mcp-server", version: "2.1.0" },
+      { name: "n8n-mcp-server", version: "2.5.0" },
       { capabilities: { tools: {} } }
     );
 
@@ -1289,13 +1971,234 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  // VAPI OpenAI-compatible proxy: forwards VAPI payload to n8n webhook (which handles OpenAI format natively)
+  // /vapi/chat/completions → inbound (voice-gateway)
+  // /vapi-outbound/chat/completions → outbound (voice-gateway-outbound)
+  const vapiRoutes = {
+    "/vapi/chat/completions": "/webhook/voice-gateway",
+    "/vapi-outbound/chat/completions": "/webhook/voice-gateway-outbound",
+  };
+  if (req.method === "POST" && vapiRoutes[req.url]) {
+    const n8nWebhookPath = vapiRoutes[req.url];
+    let body = "";
+    let startTime = Date.now();
+    let callId = 'unknown';
+    const MAX_BODY = 512 * 1024; // 512KB limit
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > MAX_BODY) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "Request too large", type: "invalid_request_error" } }));
+        return;
+      }
+    }
+    try {
+      const openaiReq = JSON.parse(body);
+
+      callId = openaiReq.call?.id || 'none';
+      startTime = Date.now();
+      console.error(`[VAPI] Incoming: messages=${(openaiReq.messages||[]).length}, call_id=${callId}, stream=${openaiReq.stream}`);
+
+      // ── OUTBOUND METADATA INJECTION ──
+      // Vapi Chat API does NOT forward session metadata in call.metadata.
+      // For outbound routes, ensure outbound=true is always set.
+      // Strategy: query Vapi session API to get session metadata, cache by assistant ID with TTL.
+      if (n8nWebhookPath === '/webhook/voice-gateway-outbound') {
+        if (!openaiReq.call) openaiReq.call = {};
+        if (!openaiReq.call.metadata) openaiReq.call.metadata = {};
+        const cm = openaiReq.call.metadata;
+        if (!cm.outbound) cm.outbound = true;
+
+        // If use_case missing, try to fetch from Vapi session API
+        if (!cm.use_case || !cm.forced_intent) {
+          // Cache by Vapi session ID (unique per conversation) with 5-minute TTL
+          if (!global._outboundMetadataCache) global._outboundMetadataCache = {};
+          const sessionId = openaiReq.metadata?.sessionId || openaiReq.call?.id || '';
+          const assistantId = openaiReq.assistant?.id || '';
+          const cacheKey = sessionId || 'default';
+          const cached = global._outboundMetadataCache[cacheKey];
+          const now = Date.now();
+
+          // Prune old cache entries (> 5 min) to prevent memory leak
+          for (const k of Object.keys(global._outboundMetadataCache)) {
+            if (now - (global._outboundMetadataCache[k]._ts || 0) > 300000) {
+              delete global._outboundMetadataCache[k];
+            }
+          }
+
+          if (cached && (now - cached._ts) < 300000) {
+            const { _ts, ...meta } = cached;
+            Object.assign(cm, meta);
+            console.error(`[VAPI] Outbound metadata from cache (session=${cacheKey}): ${JSON.stringify(cm)}`);
+          } else {
+            // Query Vapi session API for recent sessions with this assistant
+            try {
+              if (assistantId) {
+                const sessRes = await axios.get(`https://api.vapi.ai/session?assistantId=${assistantId}&limit=20`, {
+                  headers: { 'Authorization': `Bearer ${process.env.VAPI_API_KEY || '205b02f6-0738-45d5-99e4-427b6c022312'}` },
+                  timeout: 3000
+                });
+                const sessions = sessRes.data?.results || sessRes.data || [];
+                // Find session matching our sessionId, or most recent with metadata
+                let matched = false;
+                for (const sess of sessions) {
+                  const sm = sess.metadata || {};
+                  if (sm.use_case && sm.outbound) {
+                    // If we have a sessionId, only match that specific session
+                    if (sessionId && sess.id !== sessionId) continue;
+                    if (!cm.use_case) cm.use_case = sm.use_case;
+                    if (!cm.forced_intent) cm.forced_intent = sm.forced_intent || 'RETENTION';
+                    if (!cm.active_profile) cm.active_profile = sm.active_profile || 'HIGH_END';
+                    if (sm.goal) cm.goal = sm.goal;
+                    if (sm.success_criteria) cm.success_criteria = sm.success_criteria;
+                    global._outboundMetadataCache[cacheKey] = { ...cm, _ts: now };
+                    console.error(`[VAPI] Outbound metadata from session API (${sess.id}): ${JSON.stringify(cm)}`);
+                    matched = true;
+                    break;
+                  }
+                }
+                // If sessionId didn't match, fall back to most recent session
+                if (!matched && sessionId) {
+                  for (const sess of sessions) {
+                    const sm = sess.metadata || {};
+                    if (sm.use_case && sm.outbound) {
+                      if (!cm.use_case) cm.use_case = sm.use_case;
+                      if (!cm.forced_intent) cm.forced_intent = sm.forced_intent || 'RETENTION';
+                      if (!cm.active_profile) cm.active_profile = sm.active_profile || 'HIGH_END';
+                      if (sm.goal) cm.goal = sm.goal;
+                      if (sm.success_criteria) cm.success_criteria = sm.success_criteria;
+                      global._outboundMetadataCache[cacheKey] = { ...cm, _ts: now };
+                      console.error(`[VAPI] Outbound metadata from session API fallback (${sess.id}): ${JSON.stringify(cm)}`);
+                      break;
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              console.error(`[VAPI] Session API lookup failed: ${e.message}`);
+            }
+
+            // Final fallback: detect from message content
+            if (!cm.use_case) {
+              const firstMsg = openaiReq.assistant?.firstMessage || '';
+              const sysMsg = (openaiReq.messages || []).find(m => m.role === 'system')?.content || '';
+              const assistantMsgs = (openaiReq.messages || []).filter(m => m.role === 'assistant').map(m => m.content || '').join(' ');
+              const allText = (firstMsg + ' ' + sysMsg + ' ' + assistantMsgs).toLowerCase();
+              const ucMap = [
+                { kw: ['renewal', 'contract', 'expir'], uc: 'RETENTION_CONTRACT_EXPIRY', intent: 'RETENTION' },
+                { kw: ['win back', 'winback', 'welcome back'], uc: 'RETENTION_WINBACK', intent: 'RETENTION' },
+                { kw: ['overdue', 'past-due', 'outstanding balance'], uc: 'BILLING_COLLECTION', intent: 'BILLING' },
+                { kw: ['auto-pay', 'autopay'], uc: 'BILLING_AUTOPAY_ENROLL', intent: 'BILLING' },
+                { kw: ['outage', 'service issue'], uc: 'TECH_OUTAGE_NOTIFY', intent: 'TECHNICAL' },
+                { kw: ['appointment', 'technician'], uc: 'TECH_APPT_CONFIRM_RESCHEDULE', intent: 'TECHNICAL' },
+                { kw: ['fiber upgrade', 'speed upgrade', '2g'], uc: 'SALES_FIBER_UPGRADE', intent: 'SALES' },
+                { kw: ['roaming', 'travel'], uc: 'SALES_ROAMING_ADDON', intent: 'SALES' },
+                { kw: ['survey', 'satisfaction', 'feedback'], uc: 'CX_POST_RESOLUTION_SURVEY', intent: 'CX' },
+                { kw: ['onboarding', 'welcome', 'new customer'], uc: 'CX_NEW_CUSTOMER_ONBOARDING', intent: 'CX' },
+              ];
+              for (const { kw, uc, intent } of ucMap) {
+                if (kw.some(k => allText.includes(k))) {
+                  cm.use_case = uc;
+                  cm.forced_intent = intent;
+                  break;
+                }
+              }
+              if (!cm.use_case) { cm.use_case = 'RETENTION_CONTRACT_EXPIRY'; cm.forced_intent = 'RETENTION'; }
+              // Cache the fallback result too
+              global._outboundMetadataCache[cacheKey] = { ...cm, _ts: now };
+            }
+          }
+        }
+        if (!cm.active_profile) cm.active_profile = 'HIGH_END';
+        console.error(`[VAPI] Outbound metadata final: ${JSON.stringify(cm)}`);
+      }
+
+      // Pass the full VAPI payload through to n8n — the Normalize_Input node handles OpenAI format natively
+      console.error(`[VAPI] Forwarding to ${n8nWebhookPath}`);
+      const n8nRes = await axios.post(`${N8N_BASE_URL}${n8nWebhookPath}`, openaiReq, {
+        headers: { "Content-Type": "application/json" },
+        timeout: 55000,
+      });
+
+      const elapsed = Date.now() - startTime;
+      const assistantMessage = n8nRes.data?.choices?.[0]?.message?.content || n8nRes.data?.message || "I'm sorry, could you repeat that?";
+      console.error(`[VAPI] Response: call_id=${callId}, ${elapsed}ms, ${assistantMessage.length} chars`);
+      const completionId = "chatcmpl-" + Date.now().toString(36);
+      const model = openaiReq.model || "supremo-care-agent";
+
+      if (openaiReq.stream) {
+        // SSE streaming response for VAPI
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        });
+
+        // Send the content as a single delta chunk
+        const chunk = {
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{
+            index: 0,
+            delta: { role: "assistant", content: assistantMessage },
+            finish_reason: null,
+          }],
+        };
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+
+        // Send the finish chunk
+        const done = {
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: "stop",
+          }],
+        };
+        res.write(`data: ${JSON.stringify(done)}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } else {
+        // Non-streaming response
+        const openaiRes = {
+          id: completionId,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{
+            index: 0,
+            message: { role: "assistant", content: assistantMessage },
+            finish_reason: "stop",
+          }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(openaiRes));
+      }
+    } catch (e) {
+      const elapsed = Date.now() - (startTime || Date.now());
+      console.error(`[VAPI] ERROR: ${e.message}, ${elapsed}ms, call_id=${callId || 'unknown'}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: e.message, type: "server_error" } }));
+      }
+    }
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not found");
 });
 
-httpServer.listen(PORT, () => {
-  console.error(`n8n MCP Server v2.1.0 running on port ${PORT}`);
+httpServer.listen(PORT, "127.0.0.1", () => {
+  console.error(`n8n MCP Server v2.6.0 running on 127.0.0.1:${PORT}`);
   console.error(`Streamable HTTP: http://localhost:${PORT}/mcp`);
   console.error(`Legacy SSE:     http://localhost:${PORT}/sse`);
   console.error(`Health check:   http://localhost:${PORT}/health`);
+  console.error(`Outbound Demo:  http://localhost:${PORT}/demo`);
 });
