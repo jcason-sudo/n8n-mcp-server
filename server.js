@@ -13,9 +13,12 @@ import crypto from "node:crypto";
 import axios from "axios";
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
-import { readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { AsyncLocalStorage } from "node:async_hooks";
 import dotenv from "dotenv";
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -23,9 +26,14 @@ const __dirname = dirname(__filename);
 const PORT = process.env.PORT || 3001;
 const N8N_BASE_URL = process.env.N8N_BASE_URL || "http://localhost:5678";
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
+const DEFAULT_EXECUTE_WEBHOOK_PATH = process.env.N8N_EXECUTE_WEBHOOK_PATH || "mcp-run";
 const USER_EMAIL = process.env.USER_EMAIL || "your-email@example.com";
 const SMTP_CREDENTIAL_ID = process.env.SMTP_CREDENTIAL_ID || "";
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || "";
+const MCP_AUDIT_LOG_PATH =
+  process.env.MCP_AUDIT_LOG_PATH || "/home/jcason/n8n/n8n-mcp-server/reports/mcp_audit_calls.jsonl";
+const execFileAsync = promisify(execFile);
+const requestContext = new AsyncLocalStorage();
 const n8nClient = axios.create({
   baseURL: N8N_BASE_URL,
   headers: {
@@ -44,6 +52,61 @@ const metrics = {
   mcp_validation_failures_total: 0,
   evictions_total: 0,
 };
+const GWS_READ_ONLY_COMMANDS = new Set([
+  "gmail users messages list",
+  "gmail users messages get",
+  "calendar calendarList list",
+  "calendar events list",
+]);
+
+function parseJsonSafe(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function writeAuditLog(entry) {
+  try {
+    await mkdir(dirname(MCP_AUDIT_LOG_PATH), { recursive: true });
+    await appendFile(MCP_AUDIT_LOG_PATH, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch (error) {
+    console.error(`[audit] failed to write audit log: ${error.message}`);
+  }
+}
+
+async function runGwsReadOnly(commandParts, params, correlationId) {
+  const commandKey = commandParts.join(" ");
+  if (!GWS_READ_ONLY_COMMANDS.has(commandKey)) {
+    throw new McpError(-32011, "Read-only policy violation", {
+      error_code: "READ_ONLY_POLICY_DENY",
+      retryable: false,
+      details: { command: commandKey, correlation_id: correlationId },
+    });
+  }
+
+  const args = [...commandParts, "--params", JSON.stringify(params || {}), "--format", "json"];
+  try {
+    const { stdout } = await execFileAsync("gws", args, {
+      timeout: 30000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    const parsed = parseJsonSafe(stdout);
+    return parsed ?? { raw: stdout };
+  } catch (error) {
+    const stderr = error?.stderr?.toString?.() || error?.message || "gws command failed";
+    throw new McpError(-32050, "Read-only Google API command failed", {
+      error_code: "GWS_READ_ONLY_COMMAND_FAILED",
+      retryable: false,
+      details: {
+        command: commandKey,
+        stderr,
+        correlation_id: correlationId,
+      },
+    });
+  }
+}
 
 const TOOL_INPUT_SCHEMAS = {
   list_workflows: { type: "object", properties: {}, required: [] },
@@ -106,7 +169,11 @@ const TOOL_INPUT_SCHEMAS = {
   },
   execute_workflow: {
     type: "object",
-    properties: { workflow_id: { type: "string" } },
+    properties: {
+      workflow_id: { type: "string" },
+      webhook_path: { type: "string" },
+      input: { type: "object" },
+    },
     required: ["workflow_id"],
   },
   get_execution_result: {
@@ -171,6 +238,47 @@ const TOOL_INPUT_SCHEMAS = {
     type: "object",
     properties: { workflow_id: { type: "string" }, from_node: { type: "string" }, to_node: { type: "string" } },
     required: ["workflow_id", "from_node", "to_node"],
+  },
+  gmail_list_messages_ro: {
+    type: "object",
+    properties: {
+      query: { type: "string" },
+      max_results: { type: "number" },
+      label_ids: { type: "array", items: { type: "string" } },
+      include_spam_trash: { type: "boolean" },
+    },
+    required: [],
+  },
+  gmail_get_message_ro: {
+    type: "object",
+    properties: {
+      message_id: { type: "string" },
+      format: { type: "string" },
+    },
+    required: ["message_id"],
+  },
+  calendar_list_calendars_ro: {
+    type: "object",
+    properties: {
+      max_results: { type: "number" },
+      min_access_role: { type: "string" },
+      show_hidden: { type: "boolean" },
+      show_deleted: { type: "boolean" },
+    },
+    required: [],
+  },
+  calendar_list_events_ro: {
+    type: "object",
+    properties: {
+      calendar_id: { type: "string" },
+      time_min: { type: "string" },
+      time_max: { type: "string" },
+      max_results: { type: "number" },
+      single_events: { type: "boolean" },
+      order_by: { type: "string" },
+      query: { type: "string" },
+    },
+    required: [],
   },
 };
 
@@ -397,11 +505,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       // Workflow Execution
       {
         name: "execute_workflow",
-        description: "Execute/run a workflow immediately and return the execution ID. Works with any trigger type including Manual Trigger.",
+        description: "Execute a workflow by calling an n8n webhook (default: /webhook/mcp-run) with workflow_id and optional input payload.",
         inputSchema: {
           type: "object",
           properties: {
             workflow_id: { type: "string", description: "The workflow ID to execute" },
+            webhook_path: {
+              type: "string",
+              description: "Webhook path to call (default: mcp-run, resulting URL /webhook/mcp-run)",
+            },
+            input: {
+              type: "object",
+              description: "Optional input object forwarded to the webhook payload",
+            },
           },
           required: ["workflow_id"],
         },
@@ -584,6 +700,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["workflow_id", "from_node", "to_node"],
         },
       },
+      // Google Workspace Read-Only
+      {
+        name: "gmail_list_messages_ro",
+        description: "Read-only: list Gmail messages for the authenticated mailbox",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Gmail search query (optional)" },
+            max_results: { type: "number", description: "Max results to return (default: 20)" },
+            label_ids: { type: "array", items: { type: "string" }, description: "Optional label IDs filter" },
+            include_spam_trash: { type: "boolean", description: "Include spam/trash folders (default: false)" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "gmail_get_message_ro",
+        description: "Read-only: get a Gmail message by message ID",
+        inputSchema: {
+          type: "object",
+          properties: {
+            message_id: { type: "string", description: "Gmail message ID" },
+            format: { type: "string", description: "full | metadata | minimal | raw (default: full)" },
+          },
+          required: ["message_id"],
+        },
+      },
+      {
+        name: "calendar_list_calendars_ro",
+        description: "Read-only: list calendars from Google Calendar",
+        inputSchema: {
+          type: "object",
+          properties: {
+            max_results: { type: "number", description: "Max calendars to return (default: 20)" },
+            min_access_role: { type: "string", description: "freeBusyReader | reader | writer | owner" },
+            show_hidden: { type: "boolean", description: "Include hidden calendars (default: false)" },
+            show_deleted: { type: "boolean", description: "Include deleted calendars (default: false)" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "calendar_list_events_ro",
+        description: "Read-only: list events for a calendar",
+        inputSchema: {
+          type: "object",
+          properties: {
+            calendar_id: { type: "string", description: "Calendar ID (default: primary)" },
+            time_min: { type: "string", description: "RFC3339 start window filter" },
+            time_max: { type: "string", description: "RFC3339 end window filter" },
+            max_results: { type: "number", description: "Max events to return (default: 20)" },
+            single_events: { type: "boolean", description: "Expand recurring events (default: true)" },
+            order_by: { type: "string", description: "startTime | updated (default: startTime)" },
+            query: { type: "string", description: "Free-text event search query" },
+          },
+          required: [],
+        },
+      },
     ],
   };
 });
@@ -592,8 +766,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const startedAt = Date.now();
   const correlationId = crypto.randomUUID();
   const { name, arguments: args } = request.params || {};
+  const ctx = requestContext.getStore() || {};
   metrics.mcp_tool_calls_total += 1;
   console.error(`[mcp][${correlationId}] tools/call name=${name || "unknown"}`);
+  let auditStatus = "ok";
+  let auditError = null;
+  const writeToolAudit = async () => {
+    await writeAuditLog({
+      timestamp: new Date().toISOString(),
+      actor: ctx.actor || "unknown",
+      source_ip: ctx.source_ip || null,
+      token_hash: ctx.token_hash || null,
+      session_id: ctx.session_id || null,
+      http_correlation_id: ctx.http_correlation_id || null,
+      correlation_id: correlationId,
+      tool_name: name || null,
+      parameters: args ?? {},
+      result_status: auditStatus,
+      duration_ms: Date.now() - startedAt,
+      error: auditError,
+    });
+  };
   const withCorrelation = (result) => ({
     ...result,
     _meta: {
@@ -601,21 +794,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       correlation_id: correlationId,
     },
   });
-  const toolSchema = TOOL_INPUT_SCHEMAS[name];
-  if (!toolSchema) {
-    throw new McpError(-32010, "Tool not found", {
-      error_code: "RESOURCE_NOT_FOUND",
-      retryable: false,
-      details: {
-        tool_name: name || null,
-        correlation_id: correlationId,
-      },
-    });
-  }
-
-  validateToolArgsOrThrow(name, toolSchema, args);
-
   try {
+    const toolSchema = TOOL_INPUT_SCHEMAS[name];
+    if (!toolSchema) {
+      throw new McpError(-32010, "Tool not found", {
+        error_code: "RESOURCE_NOT_FOUND",
+        retryable: false,
+        details: {
+          tool_name: name || null,
+          correlation_id: correlationId,
+        },
+      });
+    }
+
+    validateToolArgsOrThrow(name, toolSchema, args);
+
     // ============ WORKFLOW QUERIES ============
     if (name === "list_workflows") {
       const response = await n8nClient.get("/api/v1/workflows");
@@ -764,147 +957,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     // ============ WORKFLOW EXECUTION ============
     if (name === "execute_workflow") {
-      const { workflow_id } = args;
-      // Strategy: try multiple n8n API endpoints for execution
-      // n8n CE has different endpoints across versions
-      const errors = [];
+      const { workflow_id, webhook_path = DEFAULT_EXECUTE_WEBHOOK_PATH, input = {} } = args;
+      const normalizedPath = String(webhook_path).replace(/^\/+/, "");
+      const webhookUrl = `${N8N_BASE_URL}/webhook/${normalizedPath}`;
+      const triggerAt = Date.now();
+      const payload = {
+        workflow_id,
+        input,
+      };
 
-      // Attempt 1: POST /api/v1/executions (n8n >= 1.x with execution API)
+      const webhookResponse = await axios.post(webhookUrl, payload, {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      let latestExecution = null;
       try {
-        const response = await n8nClient.post("/api/v1/executions", {
-          workflowId: workflow_id,
-        });
-        const execution = response.data;
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Workflow executed!\n\nExecution ID: ${execution.data?.id || execution.id}\nStatus: ${execution.data?.status || execution.status || "running"}\n\nUse get_execution_result with the execution ID to see the output.`,
-            },
-          ],
-        };
-      } catch (e1) {
-        errors.push(`POST /executions: ${e1.response?.status} ${e1.response?.data?.message || e1.message}`);
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        const execResponse = await n8nClient.get(`/api/v1/executions?workflowId=${workflow_id}`);
+        const executions = execResponse.data.data || [];
+        latestExecution = executions.find((e) => {
+          if (!e.startedAt) return false;
+          return new Date(e.startedAt).getTime() >= triggerAt - 5000;
+        }) || executions[0] || null;
+      } catch {
+        // Best effort only; webhook response is still authoritative for trigger success.
       }
 
-      // Attempt 2: POST /api/v1/workflows/{id}/run (public API run endpoint, some versions)
-      try {
-        const response = await n8nClient.post(`/api/v1/workflows/${workflow_id}/run`);
-        const execution = response.data;
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Workflow executed!\n\nExecution ID: ${execution.data?.executionId || execution.executionId || execution.data?.id || "unknown"}\nStatus: running\n\nUse get_execution_result with the execution ID to see the output.`,
-            },
-          ],
-        };
-      } catch (e2) {
-        errors.push(`POST /api/v1/workflows/run: ${e2.response?.status} ${e2.response?.data?.message || e2.message}`);
-      }
-
-      // Attempt 3: Webhook-based execution (if workflow has a webhook node)
-      try {
-        const workflow = (await n8nClient.get(`/api/v1/workflows/${workflow_id}`)).data;
-        const webhookNode = workflow.nodes.find((n) => n.type.includes("webhook"));
-        if (webhookNode) {
-          const path = webhookNode.parameters?.path || workflow_id;
-          const httpMethod = (webhookNode.parameters?.httpMethod || "POST").toUpperCase();
-          const webhookUrl = `${N8N_BASE_URL}/webhook/${path}`;
-          const response = httpMethod === "GET"
-            ? await axios.get(webhookUrl)
-            : await axios.post(webhookUrl, { trigger: "mcp" });
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Workflow executed via webhook!\n\nWebhook URL: ${webhookUrl}\nMethod: ${httpMethod}\nResponse: ${JSON.stringify(response.data, null, 2)}`,
-              },
-            ],
-          };
-        }
-      } catch (e3) {
-        errors.push(`Webhook fallback: ${e3.response?.status || ""} ${e3.response?.data?.message || e3.message}`);
-      }
-
-      // Attempt 4: Create a temporary webhook-triggered wrapper workflow that
-      // uses the Execute Workflow node to run the target workflow
-      {
-        let tempWorkflowId = null;
-        try {
-          const wrapperPath = `_exec_${workflow_id}_${Date.now()}`;
-          const wrapperNodes = [
-            {
-              id: crypto.randomUUID(),
-              name: "Webhook",
-              type: "n8n-nodes-base.webhook",
-              position: [0, 0],
-              parameters: { path: wrapperPath, httpMethod: "GET", responseMode: "lastNode" },
-              typeVersion: 2,
-              webhookId: crypto.randomUUID(),
-            },
-            {
-              id: crypto.randomUUID(),
-              name: "Execute Target",
-              type: "n8n-nodes-base.executeWorkflow",
-              position: [300, 0],
-              parameters: { workflowId: { value: workflow_id }, mode: "once" },
-              typeVersion: 1,
-            },
-          ];
-          const wrapperWf = await n8nClient.post("/api/v1/workflows", {
-            name: `_auto_exec_${Date.now()}`,
-            nodes: wrapperNodes,
-            connections: {
-              Webhook: { main: [[{ node: "Execute Target", type: "main", index: 0 }]] },
-            },
-            settings: {},
-          });
-          tempWorkflowId = wrapperWf.data.id;
-
-          // Activate it so webhook registers
-          try {
-            await n8nClient.post(`/api/v1/workflows/${tempWorkflowId}/activate`);
-          } catch {
-            // Try PUT fallback
-            const wf = (await n8nClient.get(`/api/v1/workflows/${tempWorkflowId}`)).data;
-            wf.active = true;
-            await n8nClient.put(`/api/v1/workflows/${tempWorkflowId}`, {
-              name: wf.name, nodes: wf.nodes, connections: wf.connections,
-              settings: wf.settings || {}, active: true,
-            });
-          }
-
-          // Small delay for webhook registration
-          await new Promise(r => setTimeout(r, 1000));
-
-          // Trigger via webhook
-          const webhookUrl = `${N8N_BASE_URL}/webhook/${wrapperPath}`;
-          const execResponse = await axios.get(webhookUrl);
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Workflow executed via wrapper!\n\nTarget: ${workflow_id}\nResponse: ${JSON.stringify(execResponse.data, null, 2)}\n(wrapper workflow cleaned up)`,
-              },
-            ],
-          };
-        } catch (e4) {
-          errors.push(`Wrapper execution: ${e4.response?.status || ""} ${e4.response?.data?.message || e4.message}`);
-        } finally {
-          if (tempWorkflowId) {
-            await n8nClient.post(`/api/v1/workflows/${tempWorkflowId}/deactivate`)
-              .catch(() => {});
-            await n8nClient.delete(`/api/v1/workflows/${tempWorkflowId}`)
-              .catch(err => console.error(`Cleanup failed for wrapper ${tempWorkflowId}:`, err.message));
-          }
-        }
-      }
-
-      throw new Error(
-        `Could not execute workflow ${workflow_id}. All methods failed:\n${errors.join("\n")}\n\nTip: Ensure the workflow is saved and has a Manual Trigger or Webhook node.`
-      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Workflow triggered via webhook.\n\nWebhook URL: ${webhookUrl}\nExecution ID: ${latestExecution?.id || "not yet available"}\nStatus: ${latestExecution?.status || "triggered"}\n\nWebhook response:\n${JSON.stringify(webhookResponse.data, null, 2)}`,
+          },
+        ],
+      };
     }
     if (name === "get_execution_result") {
       const { execution_id } = args;
@@ -1276,6 +1364,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [{ type: "text", text: `Disconnected "${from_node}" ✕ "${to_node}"` }],
       };
     }
+    // ============ GOOGLE WORKSPACE (READ-ONLY) ============
+    if (name === "gmail_list_messages_ro") {
+      const { query, max_results = 20, label_ids, include_spam_trash = false } = args;
+      const params = {
+        userId: "me",
+        maxResults: max_results,
+        includeSpamTrash: include_spam_trash,
+      };
+      if (query) params.q = query;
+      if (Array.isArray(label_ids) && label_ids.length > 0) params.labelIds = label_ids;
+      const data = await runGwsReadOnly(["gmail", "users", "messages", "list"], params, correlationId);
+      return withCorrelation({
+        content: [{ type: "text", text: `Gmail messages (read-only):\n\n${JSON.stringify(data, null, 2)}` }],
+      });
+    }
+    if (name === "gmail_get_message_ro") {
+      const { message_id, format = "full" } = args;
+      const data = await runGwsReadOnly(
+        ["gmail", "users", "messages", "get"],
+        { userId: "me", id: message_id, format },
+        correlationId
+      );
+      return withCorrelation({
+        content: [{ type: "text", text: `Gmail message (read-only):\n\n${JSON.stringify(data, null, 2)}` }],
+      });
+    }
+    if (name === "calendar_list_calendars_ro") {
+      const { max_results = 20, min_access_role, show_hidden = false, show_deleted = false } = args;
+      const params = {
+        maxResults: max_results,
+        showHidden: show_hidden,
+        showDeleted: show_deleted,
+      };
+      if (min_access_role) params.minAccessRole = min_access_role;
+      const data = await runGwsReadOnly(["calendar", "calendarList", "list"], params, correlationId);
+      return withCorrelation({
+        content: [{ type: "text", text: `Calendar list (read-only):\n\n${JSON.stringify(data, null, 2)}` }],
+      });
+    }
+    if (name === "calendar_list_events_ro") {
+      const {
+        calendar_id = "primary",
+        time_min,
+        time_max,
+        max_results = 20,
+        single_events = true,
+        order_by = "startTime",
+        query,
+      } = args;
+      const params = {
+        calendarId: calendar_id,
+        maxResults: max_results,
+        singleEvents: single_events,
+        orderBy: order_by,
+      };
+      if (time_min) params.timeMin = time_min;
+      if (time_max) params.timeMax = time_max;
+      if (query) params.q = query;
+      const data = await runGwsReadOnly(["calendar", "events", "list"], params, correlationId);
+      return withCorrelation({
+        content: [{ type: "text", text: `Calendar events (read-only):\n\n${JSON.stringify(data, null, 2)}` }],
+      });
+    }
     // ============ EMAIL NOTIFICATIONS ============
     if (name === "send_result_email") {
       const { subject, body, to_email = USER_EMAIL } = args;
@@ -1373,11 +1524,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       details: { tool_name: name, correlation_id: correlationId },
     });
   } catch (error) {
-    throw mapToolError(error, {
+    auditStatus = "error";
+    const mappedError = mapToolError(error, {
       correlationId,
       toolName: name,
       durationMs: Date.now() - startedAt,
     });
+    auditError = {
+      code: mappedError.code || -32603,
+      message: mappedError.message || "Internal server error",
+      data: mappedError.data || null,
+    };
+    throw mappedError;
+  } finally {
+    await writeToolAudit();
   }
 });
 } // end registerHandlers
@@ -1463,6 +1623,20 @@ function extractBearerToken(req) {
   return "";
 }
 
+function extractActor(req, requestTokenHash) {
+  const actorHeaders = ["x-actor-id", "x-forwarded-user", "x-user-email", "x-auth-request-email"];
+  for (const key of actorHeaders) {
+    const value = req.headers[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  if (requestTokenHash) {
+    return `token:${requestTokenHash}`;
+  }
+  return "anonymous";
+}
+
 function tokenHash(token) {
   if (!token) return "";
   return crypto.createHash("sha256").update(token).digest("hex").slice(0, 16);
@@ -1520,6 +1694,43 @@ function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+/**
+ * Peek at the JSON-RPC method in the request body without consuming the stream.
+ * Replaces the request with a new Readable that replays the buffered data.
+ */
+async function peekRequestMethod(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const body = Buffer.concat(chunks);
+  const { Readable } = await import("node:stream");
+  const replay = new Readable({ read() { this.push(body); this.push(null); } });
+  Object.assign(replay, {
+    method: req.method,
+    url: req.url,
+    headers: req.headers,
+    rawHeaders: req.rawHeaders,
+    socket: req.socket,
+    httpVersion: req.httpVersion,
+    httpVersionMajor: req.httpVersionMajor,
+    httpVersionMinor: req.httpVersionMinor,
+    connection: req.connection,
+  });
+  // Replace req in the caller's scope by mutating properties
+  req._readableState = replay._readableState;
+  req.read = replay.read.bind(replay);
+  req[Symbol.asyncIterator] = replay[Symbol.asyncIterator].bind(replay);
+  req.pipe = replay.pipe.bind(replay);
+  req.unpipe = replay.unpipe.bind(replay);
+  req.on = replay.on.bind(replay);
+  req.once = replay.once.bind(replay);
+  req.removeListener = replay.removeListener.bind(replay);
+  try {
+    return JSON.parse(body.toString());
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -1786,7 +1997,10 @@ const httpServer = createServer(async (req, res) => {
       let transport = sessionId ? streamableTransports.get(sessionId) : null;
 
       // Reuse existing session for the same token when client omits session ID.
-      if (!transport && !sessionId && requestTokenHash) {
+      // Skip reuse for initialize requests — the client wants a fresh session.
+      const bodyPeek = await peekRequestMethod(req);
+      const isInitialize = bodyPeek.method === "initialize";
+      if (!transport && !sessionId && requestTokenHash && !isInitialize) {
         const mappedSessionId = tokenSessionIndex.get(requestTokenHash);
         if (mappedSessionId && streamableTransports.has(mappedSessionId)) {
           sessionId = mappedSessionId;
@@ -1928,6 +2142,8 @@ const httpServer = createServer(async (req, res) => {
       let acquiredSessionId = null;
       const existingSessionId = req.headers["mcp-session-id"];
       const resolvedSessionId = typeof existingSessionId === "string" ? existingSessionId : transport.sessionId;
+      const actor = extractActor(req, requestTokenHash);
+      const sourceIp = req.headers["x-real-ip"] || req.socket.remoteAddress || null;
       if (resolvedSessionId) {
         sessionLastActivity.set(resolvedSessionId, Date.now());
         if (requestTokenHash) {
@@ -1978,7 +2194,18 @@ const httpServer = createServer(async (req, res) => {
         res.once("close", releaseOnce);
       }
 
-      await transport.handleRequest(req, res);
+      await requestContext.run(
+        {
+          actor,
+          source_ip: sourceIp,
+          token_hash: requestTokenHash || null,
+          session_id: resolvedSessionId || null,
+          http_correlation_id: correlationId,
+        },
+        async () => {
+          await transport.handleRequest(req, res);
+        }
+      );
 
       // After handling, if a new session was created, store it
       if (transport.sessionId && !streamableTransports.has(transport.sessionId)) {

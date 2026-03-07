@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Supremo Telecom — Outbound Voice Demo</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #232733;
+    --border: #2e3345;
+    --accent: #6366f1;
+    --accent-hover: #818cf8;
+    --green: #22c55e;
+    --yellow: #eab308;
+    --red: #ef4444;
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --text-muted: #64748b;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 24px;
+  }
+  .container { max-width: 800px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; letter-spacing: -0.02em; }
+  .subtitle { color: var(--text-dim); font-size: 0.875rem; margin-bottom: 32px; }
+  .section { margin-bottom: 24px; }
+  .section-label {
+    font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 10px;
+  }
+
+  /* Use case grid — 2 columns, scrollable */
+  .uc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .card {
+    background: var(--surface); border: 2px solid var(--border);
+    border-radius: var(--radius); padding: 14px; cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .card:hover { border-color: var(--text-muted); }
+  .card.selected { border-color: var(--accent); background: var(--surface2); }
+  .card-title { font-weight: 600; font-size: 0.9rem; margin-bottom: 4px; }
+  .card-tag {
+    display: inline-block; font-size: 0.65rem; font-weight: 600;
+    padding: 2px 7px; border-radius: 99px; color: #fff; margin-bottom: 6px;
+  }
+  .tag-retention { background: #8b5cf6; }
+  .tag-billing { background: #0ea5e9; }
+  .tag-technical { background: #f97316; }
+  .tag-sales { background: #22c55e; }
+  .tag-cx { background: #ec4899; }
+  .card-desc { font-size: 0.78rem; color: var(--text-dim); line-height: 1.4; }
+
+  /* Profile cards */
+  .profile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+  /* Phone input */
+  .phone-wrapper { margin-bottom: 4px; }
+  .phone-input {
+    width: 100%; background: var(--surface); border: 2px solid var(--border);
+    border-radius: var(--radius); padding: 12px 16px; font-size: 1rem;
+    color: var(--text); outline: none; transition: border-color 0.15s;
+  }
+  .phone-input:focus { border-color: var(--accent); }
+  .phone-input::placeholder { color: var(--text-muted); }
+  .phone-hint { font-size: 0.75rem; color: var(--text-muted); margin-top: 6px; line-height: 1.4; }
+
+  /* Call button */
+  .btn-call {
+    background: var(--accent); color: #fff; border: none; border-radius: var(--radius);
+    padding: 14px 32px; font-size: 1rem; font-weight: 600; cursor: pointer;
+    transition: background 0.15s, opacity 0.15s; width: 100%; margin-top: 12px;
+  }
+  .btn-call:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-call:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* Status tile */
+  .status-tile {
+    background: var(--surface); border: 2px solid var(--border);
+    border-radius: var(--radius); padding: 20px; display: none;
+  }
+  .status-tile.visible { display: block; }
+  .status-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-muted); }
+  .status-dot.ringing { background: var(--yellow); animation: pulse 1s infinite; }
+  .status-dot.active { background: var(--green); animation: pulse 1.5s infinite; }
+  .status-dot.ended { background: var(--text-muted); }
+  .status-dot.error { background: var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .status-label { font-weight: 600; font-size: 1rem; }
+  .status-detail { font-size: 0.85rem; color: var(--text-dim); line-height: 1.5; }
+  .status-meta {
+    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+    font-size: 0.8rem; color: var(--text-muted);
+  }
+  .status-meta span { display: block; margin-bottom: 2px; }
+  .summary-box {
+    margin-top: 12px; padding: 14px; background: var(--bg); border-radius: 8px;
+    font-size: 0.85rem; line-height: 1.5; color: var(--text-dim);
+    white-space: pre-wrap; display: none; max-height: 400px; overflow-y: auto;
+  }
+  .summary-box.visible { display: block; }
+
+  .divider { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
+  .timer { font-family: 'SF Mono','Consolas',monospace; font-size: 0.9rem; color: var(--text-dim); }
+
+  @media (max-width: 600px) {
+    .uc-grid, .profile-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Supremo Telecom</h1>
+  <p class="subtitle">Outbound Voice AI Demo — Select a use case and profile, enter your phone number, and start the call.</p>
+
+  <!-- USE CASES -->
+  <div class="section">
+    <div class="section-label">Use Case</div>
+    <div class="uc-grid" id="ucGrid"></div>
+  </div>
+
+  <!-- DEMO PROFILE -->
+  <div class="section">
+    <div class="section-label">Demo Profile</div>
+    <div class="profile-grid">
+      <div class="card selected" data-profile="HIGH_END" onclick="selectCard(this,'profile')">
+        <div class="card-title">James Smith</div>
+        <div class="card-desc"><b>Gold Tier</b> · 37 months · Triple Play $135/mo<br>Miami, FL · Visa ···4821<br>Mobile + 2Gbps Fiber + Cinema Plus</div>
+      </div>
+      <div class="card" data-profile="LOW_END" onclick="selectCard(this,'profile')">
+        <div class="card-title">Maria Lopez</div>
+        <div class="card-desc"><b>Standard Tier</b> · 4 months · Prepaid $20/mo<br>Hialeah, FL · No card on file<br>Mobile only, basic plan</div>
+      </div>
+    </div>
+  </div>
+
+  <hr class="divider">
+
+  <!-- PHONE + CALL -->
+  <div class="section">
+    <div class="section-label">Your Phone Number</div>
+    <div class="phone-wrapper">
+      <input type="tel" id="phone" class="phone-input" placeholder="+1 305 555 1234" autocomplete="tel">
+      <div class="phone-hint">
+        Use international format with country code. Examples:<br>
+        US: <b>+1 305 555 1234</b> &nbsp;·&nbsp; UK: <b>+44 20 7946 0958</b> &nbsp;·&nbsp; Brazil: <b>+55 11 91234 5678</b>
+      </div>
+    </div>
+    <button class="btn-call" id="callBtn" onclick="startCall()">Start Outbound Call</button>
+  </div>
+
+  <!-- STATUS TILE -->
+  <div class="section">
+    <div class="status-tile" id="statusTile">
+      <div class="status-header">
+        <div class="status-dot" id="statusDot"></div>
+        <span class="status-label" id="statusLabel">Initializing...</span>
+        <span class="timer" id="timer"></span>
+      </div>
+      <div class="status-detail" id="statusDetail"></div>
+      <div class="status-meta" id="statusMeta"></div>
+      <div class="summary-box" id="summaryBox"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── Use Case definitions ──
+  const USE_CASES = [
+    {
+      id: 'RETENTION_CONTRACT_EXPIRY', intent: 'RETENTION', tag: 'Retention', tagClass: 'tag-retention',
+      title: 'Contract Renewal',
+      desc: 'Customer contract is expiring. Agent offers $200 loyalty credit and Cinema Plus (6 months free). Follows 3-tier retention escalation.',
+      goal: 'Retain customer by offering loyalty credit and Cinema Plus. Follow 3-tier retention protocol.',
+      success: 'Customer agrees to renew contract or accepts retention offer',
+    },
+    {
+      id: 'RETENTION_WINBACK', intent: 'RETENTION', tag: 'Retention', tagClass: 'tag-retention',
+      title: 'Win-Back (Churned)',
+      desc: 'Former customer who cancelled. Agent offers welcome-back rate with $200 credit + Cinema Plus to return.',
+      goal: 'Win back churned customer with welcome-back rate, $200 credit, and Cinema Plus.',
+      success: 'Customer agrees to reactivate service',
+    },
+    {
+      id: 'BILLING_COLLECTION', intent: 'BILLING', tag: 'Billing', tagClass: 'tag-billing',
+      title: 'Payment Collection',
+      desc: 'Customer has $170 overdue balance ($135 plan + $35 roaming). Agent offers payment via card on file, payment plan, or Auto-Pay.',
+      goal: 'Collect overdue payment of $170. Offer card on file, payment plan, or Auto-Pay.',
+      success: 'Customer makes payment or agrees to payment plan',
+    },
+    {
+      id: 'BILLING_AUTOPAY_ENROLL', intent: 'BILLING', tag: 'Billing', tagClass: 'tag-billing',
+      title: 'Auto-Pay Enrollment',
+      desc: 'Pitch $5/month Auto-Pay discount. Agent enrolls customer using Visa on file (···4821).',
+      goal: 'Enroll customer in Auto-Pay for $5/month discount using card on file.',
+      success: 'Customer enrolls in Auto-Pay',
+    },
+    {
+      id: 'TECH_OUTAGE_NOTIFY', intent: 'TECHNICAL', tag: 'Technical', tagClass: 'tag-technical',
+      title: 'Outage Notification',
+      desc: 'Proactive call about a known service outage in the area. Agent provides ETA and updates.',
+      goal: 'Notify customer of service outage, provide estimated resolution time.',
+      success: 'Customer acknowledges outage notification',
+    },
+    {
+      id: 'TECH_APPT_CONFIRM_RESCHEDULE', intent: 'TECHNICAL', tag: 'Technical', tagClass: 'tag-technical',
+      title: 'Appointment Confirm',
+      desc: 'Confirm or reschedule an upcoming technician appointment. Agent offers alternative time slots.',
+      goal: 'Confirm or reschedule technician appointment.',
+      success: 'Customer confirms or reschedules appointment',
+    },
+    {
+      id: 'SALES_FIBER_UPGRADE', intent: 'SALES', tag: 'Sales', tagClass: 'tag-sales',
+      title: 'Fiber Upgrade',
+      desc: 'Pitch fiber speed upgrade to 2Gbps Supremo Infinity plan. Agent highlights speed and value.',
+      goal: 'Upgrade customer fiber plan to 2Gbps Supremo Infinity.',
+      success: 'Customer agrees to fiber upgrade',
+    },
+    {
+      id: 'SALES_ROAMING_ADDON', intent: 'SALES', tag: 'Sales', tagClass: 'tag-sales',
+      title: 'Roaming Add-on',
+      desc: 'Pitch Travel Pass ($5/day) or roaming-included plan based on customer overage history.',
+      goal: 'Sell roaming add-on or Travel Pass based on overage history.',
+      success: 'Customer adds roaming package',
+    },
+    {
+      id: 'CX_POST_RESOLUTION_SURVEY', intent: 'CX', tag: 'CX', tagClass: 'tag-cx',
+      title: 'Post-Resolution Survey',
+      desc: 'Follow up after recent support interaction. Agent asks for 1-10 satisfaction rating and feedback.',
+      goal: 'Collect customer satisfaction rating and feedback after recent support interaction.',
+      success: 'Customer provides satisfaction rating',
+    },
+    {
+      id: 'CX_NEW_CUSTOMER_ONBOARDING', intent: 'CX', tag: 'CX', tagClass: 'tag-cx',
+      title: 'New Customer Onboarding',
+      desc: 'Welcome call to new customer. Agent confirms services are working and offers setup assistance.',
+      goal: 'Welcome new customer, confirm services are working, offer setup help.',
+      success: 'Customer confirms setup is complete',
+    },
+  ];
+
+  let selectedUC = USE_CASES[0].id;
+  let selectedProfile = 'HIGH_END';
+  let callId = null;
+  let pollInterval = null;
+  let timerInterval = null;
+  let callStartTime = null;
+
+  const profileLabels = {
+    HIGH_END: 'James Smith (Gold · $135/mo)',
+    LOW_END: 'Maria Lopez (Standard · $20/mo)',
+  };
+
+  // Build use case cards
+  function renderUseCases() {
+    const grid = document.getElementById('ucGrid');
+    grid.innerHTML = USE_CASES.map((uc, i) => `
+      <div class="card${i === 0 ? ' selected' : ''}" data-uc="${uc.id}" onclick="selectCard(this,'uc')">
+        <span class="card-tag ${uc.tagClass}">${uc.tag}</span>
+        <div class="card-title">${uc.title}</div>
+        <div class="card-desc">${uc.desc}</div>
+      </div>
+    `).join('');
+  }
+  renderUseCases();
+
+  function getUC(id) { return USE_CASES.find(u => u.id === id) || USE_CASES[0]; }
+
+  function selectCard(el, group) {
+    el.parentElement.querySelectorAll('.card').forEach(c => c.classList.remove('selected'));
+    el.classList.add('selected');
+    if (group === 'uc') selectedUC = el.dataset.uc;
+    if (group === 'profile') selectedProfile = el.dataset.profile;
+  }
+
+  function formatPhone(raw) {
+    // Strip everything except digits and leading +
+    let cleaned = raw.replace(/[^\d+]/g, '');
+    if (cleaned.startsWith('+')) return cleaned;
+    // No + prefix: assume US if 10 or 11 digits
+    const digits = cleaned.replace(/\D/g, '');
+    if (digits.length === 11 && digits.startsWith('1')) return '+' + digits;
+    if (digits.length === 10) return '+1' + digits;
+    // Otherwise just prepend +
+    return '+' + digits;
+  }
+
+  function formatDuration(ms) {
+    const s = Math.floor(ms / 1000);
+    return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+  }
+
+  function setStatus(state, label, detail, meta) {
+    const tile = document.getElementById('statusTile');
+    tile.classList.add('visible');
+    document.getElementById('statusDot').className = 'status-dot ' + state;
+    document.getElementById('statusLabel').textContent = label;
+    document.getElementById('statusDetail').textContent = detail || '';
+    document.getElementById('statusMeta').innerHTML = meta || '';
+  }
+
+  function startTimer() {
+    callStartTime = Date.now();
+    const el = document.getElementById('timer');
+    timerInterval = setInterval(() => { el.textContent = formatDuration(Date.now() - callStartTime); }, 1000);
+  }
+  function stopTimer() { if (timerInterval) clearInterval(timerInterval); }
+
+  async function startCall() {
+    const phoneRaw = document.getElementById('phone').value.trim();
+    const digits = phoneRaw.replace(/[^\d]/g, '');
+    if (!phoneRaw || digits.length < 10) {
+      alert('Enter a valid phone number with country code.\nExamples: +1 305 555 1234 (US) or +44 20 7946 0958 (UK)');
+      return;
+    }
+    const phone = formatPhone(phoneRaw);
+    const uc = getUC(selectedUC);
+    const btn = document.getElementById('callBtn');
+    btn.disabled = true;
+    btn.textContent = 'Initiating...';
+
+    document.getElementById('summaryBox').classList.remove('visible');
+    const meta = `<span>Use case: ${uc.title}</span><span>Profile: ${profileLabels[selectedProfile]}</span>`;
+    setStatus('ringing', 'Initiating Call...', `Dialing ${phone}`, meta);
+
+    try {
+      const res = await fetch('/demo-api/outbound-call', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone,
+          use_case: selectedUC,
+          forced_intent: uc.intent,
+          active_profile: selectedProfile,
+          goal: uc.goal,
+          success_criteria: uc.success,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setStatus('error', 'Call Failed', data.error || 'Unknown error');
+        btn.disabled = false;
+        btn.textContent = 'Start Outbound Call';
+        return;
+      }
+      callId = data.callId;
+      setStatus('ringing', 'Ringing...', `Call ID: ${callId.slice(0,8)}...`,
+        `<span>Use case: ${uc.title}</span><span>Profile: ${profileLabels[selectedProfile]}</span><span>Phone: ${phone}</span>`);
+      startTimer();
+      pollCallStatus();
+    } catch (e) {
+      setStatus('error', 'Connection Error', e.message);
+      btn.disabled = false;
+      btn.textContent = 'Start Outbound Call';
+    }
+  }
+
+  function pollCallStatus() {
+    if (pollInterval) clearInterval(pollInterval);
+    const uc = getUC(selectedUC);
+    pollInterval = setInterval(async () => {
+      if (!callId) return;
+      try {
+        const res = await fetch(`/demo-api/call-status/${callId}`);
+        const data = await res.json();
+        const status = data.status || 'unknown';
+        const meta = `<span>Use case: ${uc.title}</span><span>Profile: ${profileLabels[selectedProfile]}</span><span>Call ID: ${callId.slice(0,8)}...</span>`;
+
+        if (status === 'ringing' || status === 'queued') {
+          setStatus('ringing', 'Ringing...', 'Waiting for pickup...', meta);
+        } else if (status === 'in-progress') {
+          setStatus('active', 'Call In Progress', 'Conversation active with AI agent.', meta);
+        } else if (status === 'ended' || status === 'completed' || status === 'failed') {
+          clearInterval(pollInterval);
+          stopTimer();
+          const duration = data.duration ? `${Math.round(data.duration)}s` : formatDuration(Date.now() - callStartTime);
+          const reason = data.endedReason || 'completed';
+          setStatus('ended', 'Call Ended', `Duration: ${duration} · Reason: ${reason}`, meta);
+
+          const summaryBox = document.getElementById('summaryBox');
+          let summary = '';
+          if (data.transcript) {
+            summary = data.transcript;
+          } else if (data.messages && data.messages.length) {
+            summary = data.messages
+              .filter(m => m.role === 'assistant' || m.role === 'user')
+              .map(m => `${m.role === 'assistant' ? 'Agent' : 'Customer'}: ${m.content || m.message || ''}`)
+              .join('\n\n');
+          }
+          summaryBox.textContent = summary || 'No transcript available. Call may have ended before connection.';
+          summaryBox.classList.add('visible');
+          document.getElementById('callBtn').disabled = false;
+          document.getElementById('callBtn').textContent = 'Start Outbound Call';
+        }
+      } catch (e) { /* keep polling */ }
+    }, 3000);
+  }
+</script>
+</body>
+</html>
